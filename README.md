@@ -98,11 +98,7 @@ run.
 
 ## Setup for non-experts
 
-You need: a GitHub account, a **Steam account that owns CS2** (a cheap throwaway is
-fine — but it must not require the phone-app Steam Guard prompt, or automation will
-hang; email Guard is OK), and **one Linux machine you control** with Docker
-installed to act as the build runner. See **Prerequisites** above for the full list
-and the install commands.
+You need: a GitHub account, a **Steam account that owns CS2**
 
 ### 1. Fork this repo
 Click **Fork** (top-right). Everything below happens in *your* fork.
