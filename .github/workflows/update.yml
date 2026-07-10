@@ -13,8 +13,8 @@ name: update
 #     the whole pipeline end-to-end without waiting for a real update.
 
 on:
-  #schedule:
-  #  - cron: "*/30 * * * *"
+  schedule:
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -53,13 +53,29 @@ jobs:
       MODE: ${{ inputs.mode || 'baseline' }}
       CSS_REF: ${{ inputs.css_ref || 'main' }}
     steps:
-      - name: Checkout updater
-        uses: actions/checkout@v4
       - name: Wipe scratch work dir (clears root-owned Docker leftovers)
         run: |
-          sudo rm -rf "$WORK" 2>/dev/null || rm -rf "$WORK" || true
+          # The native/managed builds run in Docker as root and leave root-owned
+          # files under $WORK. The runner user often can't delete those and may not
+          # have passwordless sudo -- but it CAN run Docker, and Docker runs as
+          # root, so use a throwaway container to remove them. Falls back to sudo,
+          # then a plain rm. $STATE is never touched (it holds the baseline binary
+          # that must persist across runs).
+          WORK_PARENT="$(cd "$(dirname "$WORK")" && pwd)"
+          WORK_NAME="$(basename "$WORK")"
+          TARGET="$WORK_PARENT/$WORK_NAME"
+          if [ -e "$TARGET" ]; then
+            echo "removing $TARGET"
+            docker run --rm -v "$WORK_PARENT:/w" alpine:3 sh -c "rm -rf \"/w/$WORK_NAME\"" \
+              || sudo rm -rf "$TARGET" \
+              || rm -rf "$TARGET" \
+              || true
+          fi
           rm -rf "$OUT" 2>/dev/null || true
           mkdir -p "$WORK" "$OUT"
+
+      - name: Checkout updater
+        uses: actions/checkout@v4
 
       - name: Tooling
         run: |
