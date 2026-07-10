@@ -22,7 +22,7 @@ Offsets work differently. They are numbers that point to a specific slot in a cl
 
 Both methods break when the game updates because the compiler rearranges everything. It changes how registers are used, decides to inline code differently, and shifts functions around. The underlying logic of the function stays the same, but the exact bytes change, causing the signature to fail and offsets to point to the wrong slots.
 
-## The Core Idea
+## The Idea
 
 An update changes a function's exact bytes, but it doesn't change what the function actually does.
 
@@ -40,7 +40,7 @@ We start with what we know: the old binary. The signatures in gamedata.json were
 
 First, the tool runs the old signatures against the old binary to find the exact memory address of every function we need. Once we have those old locations, we can analyze how the functions are written and look for them in the new update.
 
-## Strings: The Reliable Clue
+## The Reliable Clue
 
 If a function uses a specific text string, it is usually easy to find because text strings rarely change during an update. If the source code says "TerminateRound: unknown round end ID %i\n", the compiler places those exact text bytes into the data section (.rodata). The function code just references that location. The address of the text might change, but the text itself remains identical.
 
@@ -60,7 +60,7 @@ A single string isn't always enough. Common text logs appear in hundreds of func
 
 Many functions do not use text strings at all. We need a backup plan for those.
 
-## Structural Fingerprints: The Main Workhorse
+## Structural Fingerprints: The Greatest Strength
 
 For every function, the tool builds a simple structural profile. It counts:
 
@@ -124,7 +124,7 @@ After processing each instruction, it checks if the resulting signature is compl
 
 If two different functions happen to have identical code bodies, the tool recognizes the ambiguity and refuses to output a guess.
 
-## Common Traps
+## Traps
 
 A few minor details caused significant issues during development:
 
