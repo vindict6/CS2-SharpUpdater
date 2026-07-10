@@ -1,4 +1,5 @@
 # CS2-SharpUpdater
+Please consider donating if this helps you! buymeacoffee.com/theboneman
 
 **Keep your CounterStrikeSharp server working the moment Counter-Strike 2 updates —
 automatically.**
