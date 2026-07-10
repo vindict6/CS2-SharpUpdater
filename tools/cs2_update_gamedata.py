@@ -1,0 +1,804 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+cs2_update_gamedata.py - end-to-end CounterStrikeSharp gamedata recovery.
+
+Given the previous ("old") and current ("new") libserver.so plus the current
+gamedata.json, this:
+  1. SIGNATURES: scans every sig entry against the new binary. For any that
+     no longer resolve uniquely, it re-locates the function in the new build
+     via string anchoring + CFG fingerprint (validated against the old function
+     that the old sig points to) and regenerates a fresh unique signature.
+  2. OFFSETS: for every vtable-index offset entry, it extracts the class vtable
+     from both builds via RTTI, matches the old function at the stored index to
+     its new counterpart, and reads off the new index. Non-vtable / field
+     offsets are left untouched and flagged (they need SDK-level struct diffing).
+  3. Writes an updated gamedata.json + a machine-readable report.
+
+Everything is verified statically: every emitted sig is confirmed to match
+exactly one address in the new binary, and every offset change is backed by a
+high CFG-cosine function match. Anything uncertain is FLAGGED, never guessed.
+
+Pure Python 3 + pyelftools + capstone. No Ghidra.
+
+Usage:
+  python3 cs2_update_gamedata.py \
+      --old  libserver.OLD.so \
+      --new  libserver.so \
+      --gamedata configs/addons/counterstrikesharp/gamedata/gamedata.json \
+      --out  gamedata.updated.json \
+      --report report.json
+  # exit code 0 = clean (nothing broken or all repaired), 2 = items need review
+"""
+import sys, os, json, argparse, struct, math
+from collections import OrderedDict, Counter
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from elftools.elf.elffile import ELFFile
+from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+from capstone.x86 import X86_OP_MEM, X86_OP_IMM, X86_REG_RIP
+
+
+# --------------------------------------------------------------------------- #
+#  low-level binary access
+# --------------------------------------------------------------------------- #
+class Binary:
+    def __init__(self, path):
+        self.path = path
+        self.f = open(path, "rb")
+        self.elf = ELFFile(self.f)
+        self.secs = [(s["sh_addr"], s["sh_addr"] + s["sh_size"], s.name, s["sh_offset"])
+                     for s in self.elf.iter_sections() if s["sh_addr"]]
+        t = self.elf.get_section_by_name(".text")
+        self.text = t.data()
+        self.tva = t["sh_addr"]
+        self.tend = t["sh_addr"] + t["sh_size"]
+        self.rodata = [(s.name, s["sh_addr"], s.data())
+                       for s in self.elf.iter_sections()
+                       if s.name.startswith(".rodata") and s["sh_addr"]]
+        self.md = Cs(CS_ARCH_X86, CS_MODE_64)
+        self.md.detail = True
+        self._entries = None
+        self._fp_cache = {}
+        self._vt_cache = {}
+
+    # ---- raw reads ----
+    def read_va(self, va, n):
+        for lo, hi, name, off in self.secs:
+            if lo <= va < hi:
+                self.f.seek(off + (va - lo))
+                return self.f.read(n)
+        return None
+
+    def in_text(self, va):
+        return self.tva <= va < self.tend
+
+    def cstr(self, va, maxlen=240):
+        raw = self.read_va(va, maxlen)
+        if not raw:
+            return None
+        e = raw.find(b"\x00")
+        if e < 3:
+            return None
+        try:
+            t = raw[:e].decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        if all(32 <= ord(c) < 127 or c in "\t\n" for c in t):
+            return t
+        return None
+
+    # ---- function entry set (prologue after int3 padding) ----
+    def entries(self):
+        if self._entries is not None:
+            return self._entries
+        data = self.text
+        ent = []
+        i = 2
+        n = len(data)
+        while i < n:
+            # a real function boundary is preceded by >=2 int3 padding bytes;
+            # a lone 0xCC can be an instruction encoding byte (e.g. ModRM of
+            # `mov r12, rcx` = 49 89 CC) and must not be treated as padding.
+            if (data[i - 1] == 0xCC and data[i - 2] == 0xCC and data[i] != 0xCC
+                    and _is_prologue(data[i:i + 4])):
+                ent.append(self.tva + i)
+            i += 1
+        self._entries = sorted(set(ent))
+        return self._entries
+
+    def containing_entry(self, va):
+        import bisect
+        e = self.entries()
+        i = bisect.bisect_right(e, va) - 1
+        return e[i] if i >= 0 else None
+
+    # ---- per-function fingerprint ----
+    def fingerprint(self, entry_va, max_insns=6000, max_bytes=80000):
+        key = entry_va
+        if key in self._fp_cache:
+            return self._fp_cache[key]
+        fp = self._fingerprint(entry_va, max_insns, max_bytes)
+        self._fp_cache[key] = fp
+        return fp
+
+    def _fingerprint(self, entry_va, max_insns=6000, max_bytes=80000):
+        off = entry_va - self.tva
+        code = self.text[off:off + max_bytes]
+        mnem = Counter()
+        strings = []
+        seen = set()
+        calls = 0
+        leaders = {entry_va}
+        edges = 0
+        end_va = entry_va
+        highest = entry_va
+        insns = 0
+        for ins in self.md.disasm(code, entry_va):
+            insns += 1
+            end_va = ins.address + ins.size
+            m = ins.mnemonic
+            mnem[m.upper()] += 1
+            for op in ins.operands:
+                if op.type == X86_OP_MEM and op.mem.base == X86_REG_RIP and op.mem.index == 0:
+                    s = self.cstr(ins.address + ins.size + op.mem.disp)
+                    if s and s not in seen:
+                        seen.add(s)
+                        strings.append(s)
+            if m == "call":
+                calls += 1
+            if m.startswith("j"):
+                for op in ins.operands:
+                    if op.type == X86_OP_IMM:
+                        edges += 1
+                        t = op.imm
+                        if entry_va <= t < entry_va + max_bytes:
+                            leaders.add(t)
+                        if t > highest:
+                            highest = t
+                if m != "jmp":
+                    edges += 1
+            if m in ("ret", "jmp") and end_va > highest:
+                nxt = code[end_va - entry_va: end_va - entry_va + 1]
+                if nxt in (b"\xcc", b""):
+                    break
+            if insns >= max_insns:
+                break
+        return dict(addr=entry_va, size=end_va - entry_va, insns=insns,
+                    blocks=len(leaders), edges=edges, calls=calls,
+                    mnem=dict(mnem), strings=strings)
+
+
+def _is_prologue(b):
+    if len(b) < 2:
+        return False
+    if b[:4] == b"\xf3\x0f\x1e\xfa":       # endbr64
+        return True
+    if b[0] == 0x55:                        # push rbp
+        return True
+    if b[:2] in (b"\x41\x54", b"\x41\x55", b"\x41\x56", b"\x41\x57"):
+        return True
+    if b[0] in (0x53, 0x56, 0x57):
+        return True
+    if b[:3] == b"\x48\x83\xec" or b[:2] == b"\x48\x89":
+        return True
+    return False
+
+
+def mnem_cos(a, b):
+    ks = set(a) | set(b)
+    dot = sum(a.get(k, 0) * b.get(k, 0) for k in ks)
+    na = math.sqrt(sum(v * v for v in a.values()))
+    nb = math.sqrt(sum(v * v for v in b.values()))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+# --------------------------------------------------------------------------- #
+#  signature scanning / parsing / generation
+# --------------------------------------------------------------------------- #
+def parse_sig(sig):
+    pat = bytearray()
+    mask = bytearray()
+    for tok in sig.split():
+        if tok in ("?", "??", "2A", "*"):
+            pat.append(0)
+            mask.append(0)
+        else:
+            pat.append(int(tok, 16))
+            mask.append(1)
+    return bytes(pat), bytes(mask)
+
+
+def scan(binary, sig, limit=None):
+    pat, mask = parse_sig(sig)
+    data = binary.text
+    n = len(pat)
+    first = next((i for i, m in enumerate(mask) if m), 0)
+    anchor = pat[first]
+    start = 0
+    hits = []
+    while True:
+        i = data.find(anchor, start)
+        if i < 0:
+            break
+        s = i - first
+        if 0 <= s and s + n <= len(data):
+            ok = True
+            for j in range(n):
+                if mask[j] and data[s + j] != pat[j]:
+                    ok = False
+                    break
+            if ok:
+                hits.append(binary.tva + s)
+                if limit and len(hits) >= limit:
+                    return hits
+        start = i + 1
+    return hits
+
+
+def _wildcard_positions(ins):
+    wc = set()
+    raw = ins.bytes
+    for op in ins.operands:
+        if op.type == X86_OP_MEM and op.mem.base == X86_REG_RIP:
+            enc = struct.pack("<I", op.mem.disp & 0xFFFFFFFF)
+            idx = raw.rfind(enc)
+            if idx >= 0:
+                wc.update(range(idx, idx + 4))
+    if ins.mnemonic == "call" or ins.mnemonic.startswith("j"):
+        for op in ins.operands:
+            if op.type == X86_OP_IMM and ins.size >= 5:
+                wc.update(range(ins.size - 4, ins.size))
+    return wc
+
+
+def gen_sig(binary, entry_va, max_insns=48, tail_margin=1):
+    off = entry_va - binary.tva
+    code = binary.text[off:off + max_insns * 15]
+    pat = bytearray()
+    mask = bytearray()
+    toks = []
+    made_unique = None
+    used = 0
+    for ins in binary.md.disasm(code, entry_va):
+        if ins.bytes[:1] == b"\xcc":
+            break
+        wc = _wildcard_positions(ins)
+        for k, b in enumerate(ins.bytes):
+            if k in wc:
+                pat.append(0); mask.append(0); toks.append("?")
+            else:
+                pat.append(b); mask.append(1); toks.append("%02X" % b)
+        used += 1
+        if len(scan_pm(binary, bytes(pat), bytes(mask), 2)) == 1:
+            if made_unique is None:
+                made_unique = used
+            if used >= made_unique + tail_margin:
+                break
+        if used >= max_insns:
+            break
+    while toks and toks[-1] == "?":
+        toks.pop(); pat.pop(); mask.pop()
+    sig = " ".join(toks)
+    unique = len(scan_pm(binary, bytes(pat), bytes(mask), 2)) == 1
+    return sig, unique
+
+
+def scan_pm(binary, pat, mask, limit):
+    data = binary.text
+    n = len(pat)
+    first = next((i for i, m in enumerate(mask) if m), 0)
+    anchor = pat[first]
+    start = 0
+    hits = []
+    while True:
+        i = data.find(anchor, start)
+        if i < 0:
+            break
+        s = i - first
+        if 0 <= s and s + n <= len(data):
+            ok = True
+            for j in range(n):
+                if mask[j] and data[s + j] != pat[j]:
+                    ok = False
+                    break
+            if ok:
+                hits.append(s)
+                if len(hits) >= limit:
+                    return hits
+        start = i + 1
+    return hits
+
+
+# --------------------------------------------------------------------------- #
+#  string-anchored relocation
+# --------------------------------------------------------------------------- #
+_LEA_FORMS = []
+for _rex in (b"\x48", b"\x4c"):
+    for _op in (b"\x8d", b"\x8b"):
+        for _r in range(8):
+            _LEA_FORMS.append((_rex + _op, bytes([0x05 | (_r << 3)])))
+
+
+def string_vas(binary, s):
+    needle = s.encode() + b"\x00"
+    out = []
+    for name, base, data in binary.rodata:
+        i = 0
+        while True:
+            i = data.find(needle, i)
+            if i < 0:
+                break
+            if i == 0 or data[i - 1] == 0:
+                out.append(base + i)
+            i += 1
+    return out
+
+
+def xref_sites(binary, sva):
+    hits = set()
+    data = binary.text
+    for prefix, modrm in _LEA_FORMS:
+        ilen = len(prefix) + 1 + 4
+        head = prefix + modrm
+        start = 0
+        while True:
+            i = data.find(head, start)
+            if i < 0:
+                break
+            insn_addr = binary.tva + i
+            disp = sva - (insn_addr + ilen)
+            if -0x80000000 <= disp <= 0x7fffffff:
+                if data[i + len(head): i + len(head) + 4] == struct.pack("<i", disp):
+                    hits.add(insn_addr)
+            start = i + 1
+    return hits
+
+
+def locate_by_strings(binary, strings):
+    """entry_va -> set(strings referenced), using the function entry set."""
+    from collections import defaultdict
+    hits = defaultdict(set)
+    for s in strings:
+        for sva in string_vas(binary, s):
+            for site in xref_sites(binary, sva):
+                e = binary.containing_entry(site)
+                if e is not None:
+                    hits[e].add(s)
+    return dict(hits)
+
+
+def distinctive(strings):
+    out = [s for s in strings
+           if len(s) >= 8 and ("%" in s or "::" in s or s.startswith("#")
+                               or ".cpp" in s or "\n" in s or s.count(" ") >= 2)]
+    return sorted(set(out), key=lambda s: -len(s))[:6]
+
+
+# --------------------------------------------------------------------------- #
+#  RTTI vtable extraction (for offset recovery)
+# --------------------------------------------------------------------------- #
+def mangled_name(class_name):
+    # Itanium: bare type name is <len><identifier> for a simple class.
+    return ("%d%s" % (len(class_name), class_name)).encode()
+
+
+def find_in_sections(binary, prefixes, needle):
+    out = []
+    for lo, hi, name, off in binary.secs:
+        if not any(name.startswith(p) for p in prefixes):
+            continue
+        binary.f.seek(off)
+        data = binary.f.read(hi - lo)
+        i = 0
+        while True:
+            i = data.find(needle, i)
+            if i < 0:
+                break
+            out.append(lo + i)
+            i += 1
+    return out
+
+
+def vtable_functions(binary, class_name):
+    """Return the list of virtual-function VAs for class_name's primary vtable,
+    or None if not found."""
+    if class_name in binary._vt_cache:
+        return binary._vt_cache[class_name]
+    res = _vtable_functions(binary, class_name)
+    binary._vt_cache[class_name] = res
+    return res
+
+
+def _vtable_functions(binary, class_name):
+    mn = mangled_name(class_name)
+    # name string must be preceded by \0 (its own start)
+    name_candidates = []
+    for lo, hi, name, off in binary.secs:
+        if not name.startswith(".rodata"):
+            continue
+        binary.f.seek(off)
+        data = binary.f.read(hi - lo)
+        i = 0
+        while True:
+            i = data.find(mn, i)
+            if i < 0:
+                break
+            if i == 0 or data[i - 1] == 0:
+                # and immediately followed by \0 (exact type name)
+                if data[i + len(mn): i + len(mn) + 1] == b"\x00":
+                    name_candidates.append(lo + i)
+            i += 1
+    for nva in name_candidates:
+        for r in find_in_sections(binary, (".data.rel.ro", ".rodata"),
+                                  struct.pack("<Q", nva)):
+            ti = r - 8                      # typeinfo object = name_ptr slot - 8
+            for vr in find_in_sections(binary, (".data.rel.ro",),
+                                      struct.pack("<Q", ti)):
+                ott = binary.read_va(vr - 8, 8)
+                if ott and struct.unpack("<q", ott)[0] == 0:   # primary vtable
+                    funcs = []
+                    k = 0
+                    while True:
+                        p = binary.read_va(vr + 8 + k * 8, 8)
+                        if not p:
+                            break
+                        v = struct.unpack("<Q", p)[0]
+                        if not binary.in_text(v):
+                            break
+                        funcs.append(v)
+                        k += 1
+                        if k > 4000:
+                            break
+                    if funcs:
+                        return funcs
+    return None
+
+
+def recover_vtable_index(old, new, old_funcs, new_funcs, old_idx, band=8):
+    """Given the old function at old_idx, find its new index via CFG match in a
+    band around old_idx. Returns (new_idx, cosine) or (None, 0)."""
+    if old_idx >= len(old_funcs):
+        return None, 0.0
+    of = old.fingerprint(old_funcs[old_idx])
+    lo = max(0, old_idx - band)
+    hi = min(len(new_funcs), old_idx + band + 1)
+    best = (None, -1.0)
+    for j in range(lo, hi):
+        nf = new.fingerprint(new_funcs[j])
+        c = mnem_cos(of["mnem"], nf["mnem"])
+        szsim = 1 - abs(of["size"] - nf["size"]) / (max(of["size"], nf["size"]) + 1)
+        score = 0.75 * c + 0.25 * szsim
+        if score > best[1]:
+            best = (j, score, c)
+    return best[0], best[2]
+
+
+# --------------------------------------------------------------------------- #
+#  offset entry -> (class, index) heuristic
+# --------------------------------------------------------------------------- #
+def split_class_method(entry_name):
+    """Return a list of (class, method) candidates to try, longest class first.
+    CS gamedata uses Class_Method, but class names themselves contain '_'
+    (e.g. CCSPlayer_ItemServices_GiveNamedItem -> class CCSPlayer_ItemServices).
+    We yield every split point so the caller can pick the one whose class has a
+    real vtable."""
+    if "::" in entry_name:
+        c, m = entry_name.split("::", 1)
+        return [(c, m)]
+    parts = entry_name.split("_")
+    if len(parts) < 2:
+        return []
+    cands = []
+    for cut in range(len(parts) - 1, 0, -1):
+        cls = "_".join(parts[:cut])
+        method = "_".join(parts[cut:])
+        cands.append((cls, method))
+    return cands
+
+
+# --------------------------------------------------------------------------- #
+#  main driver
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--old", required=True)
+    ap.add_argument("--new", required=True)
+    ap.add_argument("--gamedata", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--report", required=True)
+    ap.add_argument("--min-cos", type=float, default=0.90,
+                    help="minimum CFG cosine to accept an offset/sig match")
+    args = ap.parse_args()
+
+    old = Binary(args.old)
+    new = Binary(args.new)
+    with open(args.gamedata) as fh:
+        gd = json.load(fh, object_pairs_hook=OrderedDict)
+
+    report = OrderedDict(signatures=OrderedDict(), offsets=OrderedDict(),
+                        summary=OrderedDict())
+    changed = 0
+    needs_review = 0
+
+    # ---------------- signatures ----------------
+    for name, entry in gd.items():
+        if "signatures" not in entry or "linux" not in entry["signatures"]:
+            continue
+        sig = entry["signatures"]["linux"]
+        new_hits = scan(new, sig, limit=3)
+        if len(new_hits) == 1:
+            report["signatures"][name] = {"status": "OK"}
+            continue
+        old_hits = scan(old, sig, limit=3)
+        if len(new_hits) > 1:
+            # ambiguous, not broken. If it was ALSO ambiguous in old, leave it -
+            # CSS has always used first-match here; don't manufacture uniqueness.
+            if len(old_hits) > 1:
+                report["signatures"][name] = {"status": "AMBIGUOUS_BY_DESIGN",
+                                              "matches": len(new_hits),
+                                              "note": "ambiguous in old build too; left unchanged"}
+                continue
+            # became ambiguous this update: tighten to the correct instance
+        rec = recover_signature(old, new, name, old_hits, sig, args.min_cos)
+        report["signatures"][name] = rec
+        if rec["status"] == "REPAIRED":
+            entry["signatures"]["linux"] = rec["new_sig"]
+            changed += 1
+        elif len(new_hits) == 0:
+            needs_review += 1
+
+    # ---------------- offsets ----------------
+    for name, entry in gd.items():
+        if "offsets" not in entry or "linux" not in entry["offsets"]:
+            continue
+        old_idx = entry["offsets"]["linux"]
+        cands = split_class_method(name)
+        if not cands:
+            report["offsets"][name] = {"status": "SKIP_NOT_VTABLE"}
+            continue
+        # pick the longest class prefix that actually has a vtable in both builds
+        cls = None
+        old_funcs = new_funcs = None
+        for c, method in cands:
+            of = vtable_functions(old, c)
+            nf = vtable_functions(new, c)
+            if of and nf:
+                cls, old_funcs, new_funcs = c, of, nf
+                break
+        if cls is None:
+            report["offsets"][name] = {"status": "SKIP_NO_VTABLE",
+                                       "tried": [c for c, _ in cands]}
+            continue
+        if old_idx >= len(old_funcs):
+            report["offsets"][name] = {"status": "SKIP_FIELD_OFFSET",
+                                       "class": cls, "old_index": old_idx,
+                                       "vtable_size": len(old_funcs)}
+            continue
+        new_idx, cos = recover_vtable_index(old, new, old_funcs, new_funcs, old_idx)
+        if new_idx is None or cos < args.min_cos:
+            report["offsets"][name] = {"status": "LOW_CONFIDENCE", "class": cls,
+                                       "old_index": old_idx,
+                                       "candidate_index": new_idx,
+                                       "cosine": round(cos, 4)}
+            needs_review += 1
+            continue
+        status = "OK" if new_idx == old_idx else "REPAIRED"
+        rec = {"status": status, "class": cls, "old_index": old_idx,
+               "new_index": new_idx, "cosine": round(cos, 4)}
+        # borderline confidence: apply but ask for eyes
+        if cos < 0.97 and new_idx != old_idx:
+            rec["review"] = "borderline cosine; verify on server"
+            needs_review += 1
+        report["offsets"][name] = rec
+        if new_idx != old_idx:
+            entry["offsets"]["linux"] = new_idx
+            changed += 1
+
+    report["summary"] = {
+        "changed": changed,
+        "needs_review": needs_review,
+        "sig_ok": sum(1 for v in report["signatures"].values() if v["status"] == "OK"),
+        "sig_repaired": sum(1 for v in report["signatures"].values() if v["status"] == "REPAIRED"),
+        "sig_broken": sum(1 for v in report["signatures"].values()
+                          if v["status"] in ("BROKEN", "AMBIGUOUS")),
+        "off_ok": sum(1 for v in report["offsets"].values() if v["status"] == "OK"),
+        "off_repaired": sum(1 for v in report["offsets"].values() if v["status"] == "REPAIRED"),
+    }
+
+    with open(args.out, "w") as fh:
+        json.dump(gd, fh, indent=2)
+    with open(args.report, "w") as fh:
+        json.dump(report, fh, indent=2)
+
+    s = report["summary"]
+    print("[cs2-recover] changed=%d needs_review=%d | sigs ok=%d repaired=%d broken=%d | "
+          "offsets ok=%d repaired=%d"
+          % (s["changed"], s["needs_review"], s["sig_ok"], s["sig_repaired"],
+             s["sig_broken"], s["off_ok"], s["off_repaired"]))
+    sys.exit(2 if needs_review else 0)
+
+
+def estimate_size(binary, addr):
+    """Cheap size estimate = distance to the next function entry. Avoids full
+    disassembly for prescreening fallback candidates."""
+    import bisect
+    e = binary.entries()
+    i = bisect.bisect_right(e, addr)
+    if i < len(e):
+        return e[i] - addr
+    return binary.tend - addr
+
+
+def call_targets(binary, entry_va, max_bytes=400):
+    """Direct call/jmp rel32 targets from a function body, in order."""
+    off = entry_va - binary.tva
+    code = binary.text[off:off + max_bytes]
+    out = []
+    for ins in binary.md.disasm(code, entry_va):
+        if ins.mnemonic in ("call", "jmp"):
+            for op in ins.operands:
+                if op.type == X86_OP_IMM:
+                    out.append(op.imm)
+        if ins.mnemonic == "ret":
+            break
+    return out
+
+
+def call_sites_to(binary, target):
+    """All .text addresses issuing a `call rel32` (E8) to target."""
+    data = binary.text
+    hits = []
+    start = 0
+    while True:
+        i = data.find(b"\xe8", start)
+        if i < 0 or i + 5 > len(data):
+            break
+        disp = struct.unpack("<i", data[i + 1:i + 5])[0]
+        if binary.tva + i + 5 + disp == target:
+            hits.append(binary.tva + i)
+        start = i + 1
+    return hits
+
+
+def match_by_cfg(old, new, of, size_lo=0.75, size_hi=1.3, block_tol=6):
+    """Best NEW entry for an OLD fingerprint within a structural band."""
+    best = (None, -1.0)
+    for e in new.entries():
+        est = estimate_size(new, e)
+        if not (size_lo * of["size"] <= est <= size_hi * of["size"]):
+            continue
+        nf = new.fingerprint(e)
+        if abs(nf["blocks"] - of["blocks"]) > block_tol:
+            continue
+        c = mnem_cos(of["mnem"], nf["mnem"])
+        if c > best[1]:
+            best = (e, c)
+    return best
+
+
+def recover_via_callees(old, new, old_addr, min_cos):
+    """For a stringless function: pick its most distinctive direct callee, match
+    that callee to NEW by CFG (large callees are near-unique), then find the NEW
+    caller whose own fingerprint best matches the OLD target. Returns (new_addr,
+    cosine) or (None, 0)."""
+    of = old.fingerprint(old_addr)
+    callees = call_targets(old, old_addr)
+    if not callees:
+        return None, 0.0
+    # rank callees by how distinctive they are (bigger = more unique)
+    ranked = sorted(set(callees),
+                    key=lambda a: old.fingerprint(a)["size"], reverse=True)
+    for callee in ranked[:2]:
+        cof = old.fingerprint(callee)
+        if cof["size"] < 200:            # too small to anchor reliably
+            continue
+        new_callee, cc = match_by_cfg(old, new, cof)
+        if new_callee is None or cc < 0.99:
+            continue
+        # find NEW callers of new_callee; pick the best CFG match to our target
+        best = (None, -1.0)
+        for site in call_sites_to(new, new_callee):
+            e = new.containing_entry(site)
+            if e is None:
+                continue
+            nf = new.fingerprint(e, max_bytes=max(400, of["size"] * 2))
+            c = mnem_cos(of["mnem"], nf["mnem"])
+            if c > best[1]:
+                best = (e, c)
+        if best[0] is not None and best[1] >= min_cos:
+            return best
+    return None, 0.0
+
+
+def recover_signature(old, new, name, old_hits, old_sig, min_cos):
+    """Locate the function in NEW and regenerate a unique sig."""
+    if len(old_hits) != 1:
+        # old sig itself is ambiguous; try string anchoring from the first hit
+        if not old_hits:
+            return {"status": "BROKEN", "reason": "old sig no longer resolves"}
+    old_addr = old_hits[0]
+    of = old.fingerprint(old_addr)
+    anchors = distinctive(of["strings"])
+
+    candidate = None
+    method = None
+    cand_cos = 0.0
+    if anchors:
+        hits = locate_by_strings(new, anchors)
+        if hits:
+            # Cosine is ground truth; anchors only narrow the candidate pool.
+            # (A small helper function can spuriously reference more shared
+            # strings than the real target when the target is huge and its
+            # xrefs get attributed to internal sub-entries. So rank by cosine.)
+            scored = []
+            for e, ss in hits.items():
+                c = mnem_cos(of["mnem"], new.fingerprint(e)["mnem"])
+                scored.append((c, len(ss), e))
+            scored.sort(reverse=True)
+            best_c, _, best_e = scored[0]
+            if best_c >= min_cos:
+                candidate, method, cand_cos = best_e, "string+cfg", best_c
+    if candidate is None:
+        # fall back to pure CFG search, prescreened by a cheap size estimate so
+        # we don't fingerprint all ~38k functions.
+        target_size = of["size"]
+        best = (None, -1.0)
+        checked = 0
+        for e in new.entries():
+            est = estimate_size(new, e)
+            if not (0.55 * target_size <= est <= 1.7 * target_size):
+                continue
+            checked += 1
+            if checked > 4000:
+                break
+            nf = new.fingerprint(e, max_bytes=max(4000, of["size"] * 2))
+            if abs(nf["blocks"] - of["blocks"]) > 40:
+                continue
+            c = mnem_cos(of["mnem"], nf["mnem"])
+            if c > best[1]:
+                best = (e, c)
+        if best[0] is not None and best[1] >= max(min_cos, 0.99):
+            candidate, method, cand_cos = best[0], "cfg", best[1]
+
+    if candidate is None:
+        # last resort for stringless wrappers: anchor on a distinctive callee
+        # and find the matching caller in the new build.
+        e, c = recover_via_callees(old, new, old_addr, max(min_cos, 0.98))
+        if e is not None:
+            candidate, method, cand_cos = e, "callee", c
+
+    if candidate is None:
+        return {"status": "BROKEN", "reason": "no confident match",
+                "old_addr": "0x%x" % old_addr}
+
+    # Snap to canonical entry: if an entry a few bytes earlier has an equal or
+    # better cosine (an alternate/aligned entry into the same body), prefer it.
+    import bisect
+    E = new.entries()
+    ci = bisect.bisect_left(E, candidate)
+    of_mnem = of["mnem"]
+    base_c = cand_cos
+    for back in range(1, 4):
+        if ci - back < 0:
+            break
+        e2 = E[ci - back]
+        if candidate - e2 > 0x40:
+            break
+        c2 = mnem_cos(of_mnem, new.fingerprint(e2)["mnem"])
+        if c2 >= base_c - 0.001:
+            candidate, cand_cos = e2, c2
+
+    sig, unique = gen_sig(new, candidate)
+    hits = scan(new, sig, limit=3)
+    if not (unique and len(hits) == 1 and hits[0] == candidate):
+        return {"status": "BROKEN", "reason": "could not cut unique sig",
+                "new_addr": "0x%x" % candidate}
+    return {"status": "REPAIRED", "method": method,
+            "old_addr": "0x%x" % old_addr, "new_addr": "0x%x" % candidate,
+            "cosine": round(cand_cos, 4),
+            "new_sig": sig}
+
+
+if __name__ == "__main__":
+    main()
