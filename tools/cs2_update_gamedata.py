@@ -680,9 +680,8 @@ def main():
         if rec["status"] == "REPAIRED":
             entry["signatures"]["linux"] = rec["new_sig"]
             changed += 1
-            if rec.get("confidence") == "low":
-                needs_review += 1
-        elif len(new_hits) == 0:
+        else:
+            # BROKEN or LOW_CONFIDENCE: leave the old sig untouched (fail-safe)
             needs_review += 1
 
     # ---------------- offsets ----------------
@@ -745,19 +744,26 @@ def main():
     # cross-check each class for vtable-order consistency and fix decoys
     reconcile_offsets(old, new, resolved_off, report)
     # recompute after reconciliation (some 'review' flags may have cleared, some
-    # entries may have flipped OK<->REPAIRED)
+    # entries may have flipped OK<->REPAIRED). A signature needs review if it is
+    # unresolved (BROKEN/AMBIGUOUS) or could not be corroborated (LOW_CONFIDENCE
+    # / confidence 'low'); the latter are NOT written to gamedata.
+    def _sig_needs_review(v):
+        return (v.get("status") in ("BROKEN", "AMBIGUOUS", "LOW_CONFIDENCE")
+                or v.get("confidence") == "low")
     changed = (sum(1 for v in report["signatures"].values() if v["status"] == "REPAIRED")
                + sum(1 for v in report["offsets"].values() if v["status"] == "REPAIRED"))
     needs_review = (sum(1 for v in report["offsets"].values()
                         if v.get("status") == "LOW_CONFIDENCE" or "review" in v)
                     + sum(1 for v in report["signatures"].values()
-                          if v["status"] in ("BROKEN", "AMBIGUOUS")))
+                          if _sig_needs_review(v)))
 
     report["summary"] = {
         "changed": changed,
         "needs_review": needs_review,
         "sig_ok": sum(1 for v in report["signatures"].values() if v["status"] == "OK"),
         "sig_repaired": sum(1 for v in report["signatures"].values() if v["status"] == "REPAIRED"),
+        "sig_low_confidence": sum(1 for v in report["signatures"].values()
+                                  if v.get("status") == "LOW_CONFIDENCE"),
         "sig_broken": sum(1 for v in report["signatures"].values()
                           if v["status"] in ("BROKEN", "AMBIGUOUS")),
         "off_ok": sum(1 for v in report["offsets"].values() if v["status"] == "OK"),
@@ -1002,45 +1008,65 @@ def corroborate(old, new, old_addr, cand, cosine, margin, of=None):
 
 
 def recover_signature(old, new, name, old_hits, old_sig, min_cos):
-    """Locate the function in NEW and regenerate a unique sig."""
-    if len(old_hits) != 1:
-        # old sig itself is ambiguous; try string anchoring from the first hit
-        if not old_hits:
-            return {"status": "BROKEN", "reason": "old sig no longer resolves"}
+    """Locate the function in NEW and regenerate a unique sig.
+
+    Rock-solid selection: rather than accept the first method that clears a
+    cosine threshold (which lets a high-cosine decoy from an early method
+    shadow the real match), gather a candidate from EVERY cheap method, then
+    corroborate each against the old function on independent axes (size,
+    blocks, strings, callees) and keep the best-supported one. The expensive
+    global CFG sweep only runs if nothing else reaches at least 'medium'.
+
+    Fail-safe: a candidate that can't be corroborated (confidence 'low') is
+    reported with its best guess but its status is LOW_CONFIDENCE and it is NOT
+    written into gamedata -- a hook with a missing sig fails cleanly (disabled),
+    whereas a hook pointed at the wrong function corrupts state."""
+    if not old_hits:
+        return {"status": "BROKEN", "reason": "old sig no longer resolves"}
     old_addr = old_hits[0]
     of = old.fingerprint(old_addr)
     anchors = distinctive(of["strings"])
 
-    candidate = None
-    method = None
-    cand_cos = 0.0
-    cand_margin = 1.0
-    # STAGE 0: old-anchored re-resolution. Handles the common "function barely
-    # changed but the exact old sig no longer resolves to exactly one" case
-    # (a changed tail instruction, or an ambiguous twin) precisely and cheaply,
-    # before the decoy-prone global CFG search.
+    cands = {}                       # addr -> [method, cosine, margin]
+
+    def offer(addr, method, cos, margin):
+        if addr is None:
+            return
+        prev = cands.get(addr)
+        if prev is None or cos > prev[1]:
+            cands[addr] = [method, cos, margin]
+
+    # --- cheap methods: all of them contribute a candidate ---
     e, c, m = recover_via_old_anchor(old, new, old_addr, old_sig, min_cos)
-    if e is not None:
-        candidate, method, cand_cos, cand_margin = e, "old-anchor", c, m
-    if candidate is None and anchors:
+    offer(e, "old-anchor", c, m)
+
+    if anchors:
         hits = locate_by_strings(new, anchors)
         if hits:
-            # Cosine is ground truth; anchors only narrow the candidate pool.
-            # (A small helper function can spuriously reference more shared
-            # strings than the real target when the target is huge and its
-            # xrefs get attributed to internal sub-entries. So rank by cosine.)
-            scored = []
-            for e, ss in hits.items():
-                c = mnem_cos(of["mnem"], new.fingerprint(e)["mnem"])
-                scored.append((c, len(ss), e))
-            scored.sort(reverse=True)
-            best_c, _, best_e = scored[0]
-            if best_c >= min_cos:
-                candidate, method, cand_cos = best_e, "string+cfg", best_c
-                cand_margin = (best_c - scored[1][0]) if len(scored) > 1 else 1.0
-    if candidate is None:
-        # fall back to pure CFG search, prescreened by a cheap size estimate so
-        # we don't fingerprint all ~38k functions.
+            scored = sorted(
+                ((mnem_cos(of["mnem"], new.fingerprint(e)["mnem"]), e)
+                 for e in hits), reverse=True)
+            best_c, best_e = scored[0]
+            mg = (best_c - scored[1][0]) if len(scored) > 1 else 1.0
+            offer(best_e, "string+cfg", best_c, mg)
+
+    e, c = recover_via_callees(old, new, old_addr, max(min_cos, 0.95))
+    offer(e, "callee", c, 1.0)
+
+    def evaluate():
+        ranked = []
+        for addr, (method, cos, margin) in cands.items():
+            corr = corroborate(old, new, old_addr, addr, cos, margin, of)
+            rank = {"high": 3, "medium": 2, "low": 1}[corr["confidence"]]
+            passed = int(corr["checks"].split("/")[0])
+            ranked.append([rank, passed, round(cos, 4), addr, method, margin])
+        ranked.sort(reverse=True)
+        return ranked
+
+    ranked = evaluate()
+
+    # --- escalate to the global CFG sweep only if nothing reached 'medium' ---
+    if not ranked or ranked[0][0] < 2:
         target_size = of["size"]
         best = (None, -1.0)
         second = -1.0
@@ -1061,36 +1087,30 @@ def recover_signature(old, new, name, old_hits, old_sig, min_cos):
                 best = (e, c)
             elif c > second:
                 second = c
-        if best[0] is not None and best[1] >= max(min_cos, 0.99):
-            candidate, method, cand_cos = best[0], "cfg", best[1]
-            cand_margin = best[1] - second if second >= 0 else 1.0
+        if best[0] is not None:
+            offer(best[0], "cfg", best[1],
+                  best[1] - second if second >= 0 else 1.0)
+            ranked = evaluate()
 
-    if candidate is None:
-        # last resort for stringless wrappers: anchor on a distinctive callee
-        # and find the matching caller in the new build.
-        e, c = recover_via_callees(old, new, old_addr, max(min_cos, 0.98))
-        if e is not None:
-            candidate, method, cand_cos = e, "callee", c
-
-    if candidate is None:
+    if not ranked:
         return {"status": "BROKEN", "reason": "no confident match",
                 "old_addr": "0x%x" % old_addr}
 
-    # Snap to canonical entry: if an entry a few bytes earlier has an equal or
-    # better cosine (an alternate/aligned entry into the same body), prefer it.
+    _, _, cand_cos, candidate, method, margin = ranked[0]
+
+    # Snap to canonical entry: prefer a nearby earlier entry with >= cosine (an
+    # aligned alternate entry into the same body), but never jump functions.
     import bisect
     E = new.entries()
     ci = bisect.bisect_left(E, candidate)
-    of_mnem = of["mnem"]
-    base_c = cand_cos
     for back in range(1, 4):
         if ci - back < 0:
             break
         e2 = E[ci - back]
         if candidate - e2 > 0x40:
             break
-        c2 = mnem_cos(of_mnem, new.fingerprint(e2)["mnem"])
-        if c2 >= base_c - 0.001:
+        c2 = mnem_cos(of["mnem"], new.fingerprint(e2)["mnem"])
+        if c2 >= cand_cos - 0.001:
             candidate, cand_cos = e2, c2
 
     sig, unique, meta = gen_sig(new, candidate)
@@ -1099,10 +1119,10 @@ def recover_signature(old, new, name, old_hits, old_sig, min_cos):
         return {"status": "BROKEN", "reason": "could not cut unique sig",
                 "new_addr": "0x%x" % candidate}
 
-    # Independent cross-check: does this candidate actually look like the old
-    # function on axes the selection didn't use? This is the rock-solid gate.
-    corr = corroborate(old, new, old_addr, candidate, cand_cos, cand_margin, of)
-    out = {"status": "REPAIRED", "method": method,
+    corr = corroborate(old, new, old_addr, candidate, cand_cos, margin, of)
+    # LOW_CONFIDENCE is not applied to gamedata (fail-safe); REPAIRED is.
+    status = "REPAIRED" if corr["confidence"] != "low" else "LOW_CONFIDENCE"
+    out = {"status": status, "method": method,
            "old_addr": "0x%x" % old_addr, "new_addr": "0x%x" % candidate,
            "cosine": round(cand_cos, 4),
            "confidence": corr["confidence"],
@@ -1111,6 +1131,8 @@ def recover_signature(old, new, name, old_hits, old_sig, min_cos):
     detail = list(corr["notes"])
     if meta["fragile"]:
         detail.append(meta["reason"])
+    if status == "LOW_CONFIDENCE":
+        detail.append("not applied: could not corroborate; left unchanged")
     if detail:
         out["review"] = "; ".join(detail)
     return out
