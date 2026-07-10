@@ -13,8 +13,8 @@ name: update
 #     the whole pipeline end-to-end without waiting for a real update.
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"
+  #schedule:
+  #  - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       mode:
