@@ -71,6 +71,7 @@ echo "    recovery rc=$RC (2 = some items flagged for review; see report)"
 echo "==> [4/6] native build (sniper SDK container)"
 docker run --rm -v "$CSS:/src" -w /src "$SNIPER" bash -euc '
   git config --global --add safe.directory /src || true
+  git config --global --add safe.directory "*" || true
   mkdir -p build && cd build
   cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
   cmake --build . --config Release -- -j"$(nproc)"
@@ -81,8 +82,13 @@ cp -r "$CSS/build/addons" "$WORK/dist/addons"
 
 echo "==> [5/6] managed build (.NET $DOTNET_TAG)"
 docker run --rm -v "$CSS:/src" -w /src "mcr.microsoft.com/dotnet/sdk:${DOTNET_TAG}" bash -euc '
-  dotnet restore managed/CounterStrikeSharp.sln
-  dotnet publish -c Release managed/CounterStrikeSharp.API
+  # CSS.API.csproj runs `git describe` to stamp a version; the repo is owned by
+  # the host user but this container runs as root, so mark it safe or git aborts
+  # with "dubious ownership" (exit 128).
+  git config --global --add safe.directory /src || true
+  git config --global --add safe.directory "*" || true
+  dotnet restore managed/CounterStrikeSharp.API/CounterStrikeSharp.API.csproj
+  dotnet publish -c Release --no-restore managed/CounterStrikeSharp.API
 '
 mkdir -p "$WORK/dist/addons/counterstrikesharp/api"
 # glob the TFM so this does not break when net10.0 -> net11.0 etc. (upstream bug)
