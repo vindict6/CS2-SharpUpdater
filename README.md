@@ -66,11 +66,8 @@ missing piece here, not the tool itself.
 
 **Accounts**
 - A **GitHub account** to hold your fork.
-- A **Steam account that owns Counter-Strike 2.** A cheap throwaway is fine, but it
-  must be able to log in non-interactively: turn off the **phone-app (mobile) Steam
-  Guard**, because that pops a confirmation prompt every login and automation will
-  just hang. Email Steam Guard is fine. Log into that account once from a desktop
-  Steam client first so it isn't flagged as brand-new on first use.
+- A **Steam account that owns Counter-Strike 2.** If you use Steam Guard, make sure
+  you have your phone out and ready during the workflows with the Steam app open.
 
 **The build machine (your self-hosted runner)** — one Linux box you control, that
 stays on. It does the downloading and building, so it needs:
