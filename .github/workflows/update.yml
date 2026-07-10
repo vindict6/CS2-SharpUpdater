@@ -13,8 +13,8 @@ name: update
 #     the whole pipeline end-to-end without waiting for a real update.
 
 on:
-  #schedule:
-  #  - cron: "*/30 * * * *"
+  schedule:
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -33,6 +33,10 @@ on:
         default: ""
       publish_release:
         description: "publish a GitHub Release with the build"
+        type: boolean
+        default: true
+      with_runtime:
+        description: "bundle the .NET runtime into the zip (off = server must have the runtime)"
         type: boolean
         default: true
 
@@ -98,6 +102,9 @@ jobs:
       - name: Run pipeline (RE + SDK bump + build)
         id: build
         if: steps.fetch.outputs.UPDATE == 'true'
+        env:
+          # default true on scheduled runs (inputs.with_runtime is empty then)
+          BUNDLE_RUNTIME: ${{ (inputs.with_runtime == false) && '0' || '1' }}
         run: |
           chmod +x tools/run_pipeline.sh
           export OLD_SO="$WORK/libserver.old.so"
