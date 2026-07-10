@@ -1,0 +1,61 @@
+name: setup-check
+
+# Run this ONCE after forking (Actions tab -> setup-check -> Run workflow).
+# It verifies your fork is configured correctly so the real pipeline won't fail
+# halfway: runner online, Docker present, Python deps installable, Steam login
+# works, and the CS2 depot is reachable. It downloads nothing large and changes
+# nothing.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: [self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner + Docker + tools
+        run: |
+          echo "runner OS: $(uname -a)"
+          if ! command -v docker >/dev/null; then echo "::error::Docker not found on runner"; exit 1; fi
+          docker --version
+          python3 --version || { echo "::error::python3 missing"; exit 1; }
+          python3 -m pip install --break-system-packages pyelftools capstone >/dev/null 2>&1 \
+            && echo "python deps OK" || echo "::warning::could not pip install (may already be present)"
+          command -v readelf >/dev/null || echo "::warning::binutils/readelf missing (needed for BuildID); apt-get install binutils"
+
+      - name: Secrets present
+        env:
+          STEAM_USER: ${{ secrets.STEAM_USER }}
+          STEAM_PASS: ${{ secrets.STEAM_PASS }}
+        run: |
+          [ -n "$STEAM_USER" ] || { echo "::error::secret STEAM_USER is not set"; exit 1; }
+          [ -n "$STEAM_PASS" ] || { echo "::error::secret STEAM_PASS is not set"; exit 1; }
+          echo "Steam secrets are set."
+
+      - name: Steam login + depot reachable (dry run)
+        env:
+          STEAM_USER: ${{ secrets.STEAM_USER }}
+          STEAM_PASS: ${{ secrets.STEAM_PASS }}
+        run: |
+          set -e
+          mkdir -p "${{ runner.temp }}/ddcheck"
+          URL=$(curl -fsSL https://api.github.com/repos/SteamRE/DepotDownloader/releases/latest \
+            | grep -oE 'https://[^"]*DepotDownloader-linux-x64\.zip' | head -1)
+          curl -fsSL "$URL" -o "${{ runner.temp }}/dd.zip"
+          unzip -o "${{ runner.temp }}/dd.zip" -d "${{ runner.temp }}/ddcheck" >/dev/null
+          chmod +x "${{ runner.temp }}/ddcheck/DepotDownloader" || true
+          # -manifest-only lists the depot manifest without downloading the payload:
+          # a cheap way to confirm login + entitlement + depot access.
+          "${{ runner.temp }}/ddcheck/DepotDownloader" -app 730 -depot 2347773 \
+            -username "$STEAM_USER" -password "$STEAM_PASS" -remember-password \
+            -manifest-only 2>&1 | tail -20 \
+            && echo "Steam login + depot 2347773 access: OK" \
+            || { echo "::error::Steam login or depot access failed. Check credentials and that the account owns CS2 / has no interactive Steam Guard."; exit 1; }
+
+      - name: Summary
+        run: echo "Setup looks good. You can now run the 'update' workflow (try manifest mode first to test)."

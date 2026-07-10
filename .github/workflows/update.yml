@@ -1,0 +1,121 @@
+name: update
+
+# CS2-SharpUpdater main pipeline.
+# On a CS2 update (or on demand), fetch old+new libserver.so, recover the CSS
+# gamedata via reverse engineering, bump the native SDK, build CounterStrikeSharp,
+# and publish a ready-to-deploy release.
+#
+# TWO WAYS TO RUN:
+#   * scheduled / automatic  - baseline mode: diffs the current build against the
+#     previous run's binary; only proceeds when the BuildID changed.
+#   * manual TEST            - manifest mode: you supply two depot manifest IDs
+#     (from https://steamdb.info/depot/2347773/manifests/) and a CSS ref. Proves
+#     the whole pipeline end-to-end without waiting for a real update.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "baseline (auto-diff) or manifest (pinned test)"
+        type: choice
+        options: [baseline, manifest]
+        default: baseline
+      css_ref:
+        description: "CounterStrikeSharp ref/tag to build (e.g. v1.0.305 or main)"
+        default: "main"
+      old_manifest:
+        description: "manifest mode: OLD depot 2347773 manifest ID"
+        default: ""
+      new_manifest:
+        description: "manifest mode: NEW depot 2347773 manifest ID"
+        default: ""
+      publish_release:
+        description: "publish a GitHub Release with the build"
+        type: boolean
+        default: true
+
+concurrency:
+  group: cs2-sharpupdater
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: [self-hosted]        # must have Steam access + Docker
+    env:
+      WORK: ${{ runner.temp }}/csu-work
+      OUT: ${{ github.workspace }}/out
+      STATE: ${{ github.workspace }}/../csu-state    # persists across runs on the box
+      MODE: ${{ inputs.mode || 'baseline' }}
+      CSS_REF: ${{ inputs.css_ref || 'main' }}
+    steps:
+      - name: Checkout updater
+        uses: actions/checkout@v4
+
+      - name: Tooling
+        run: |
+          python3 -m pip install --upgrade --break-system-packages pyelftools capstone
+          command -v unzip >/dev/null || (sudo apt-get update && sudo apt-get install -y unzip binutils zip)
+          command -v zip >/dev/null || sudo apt-get install -y zip
+          docker --version
+
+      - name: Fetch libserver.so (old + new)
+        id: fetch
+        env:
+          STEAM_USER: ${{ secrets.STEAM_USER }}
+          STEAM_PASS: ${{ secrets.STEAM_PASS }}
+          OLD_MANIFEST: ${{ inputs.old_manifest }}
+          NEW_MANIFEST: ${{ inputs.new_manifest }}
+        run: |
+          chmod +x tools/fetch_libserver.sh
+          tools/fetch_libserver.sh
+
+      - name: Run pipeline (RE + SDK bump + build)
+        id: build
+        if: steps.fetch.outputs.UPDATE == 'true'
+        env:
+          OLD_SO: ${{ env.WORK }}/libserver.old.so
+          NEW_SO: ${{ env.WORK }}/libserver.new.so
+        run: |
+          chmod +x tools/run_pipeline.sh
+          tools/run_pipeline.sh
+          echo "VERSION=$(cat "$OUT/VERSION")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: counterstrikesharp-${{ steps.build.outputs.VERSION }}
+          path: |
+            out/*.zip
+            out/gamedata.json
+            out/recovery-report.json
+
+      - name: Publish Release
+        if: steps.build.outcome == 'success' && (inputs.publish_release != false)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ steps.build.outputs.VERSION }}
+          name: CounterStrikeSharp ${{ steps.build.outputs.VERSION }}
+          body: |
+            Automated CounterStrikeSharp build with RE-recovered gamedata for CS2
+            build `${{ steps.fetch.outputs.NEW_BUILDID }}` (was `${{ steps.fetch.outputs.OLD_BUILDID }}`).
+
+            The `with-runtime` zip drops into `<server>/game/csgo/`. See the attached
+            `recovery-report.json` for which signatures/offsets were repaired and
+            anything flagged for review.
+          files: |
+            out/*.zip
+            out/gamedata.json
+            out/recovery-report.json
+
+      - name: Promote baseline (baseline mode, successful build only)
+        if: steps.build.outcome == 'success' && env.MODE == 'baseline'
+        run: |
+          mkdir -p "$STATE"
+          cp "$WORK/libserver.new.so" "$STATE/libserver.prev.so"
+          echo "baseline promoted to ${{ steps.fetch.outputs.NEW_BUILDID }}"
