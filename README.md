@@ -59,12 +59,53 @@ be dropped on a **test server first** — but in practice the recovery is accura
 
 ---
 
+## Prerequisites
+
+Before you touch the workflow, get these in place. Most of the pain people hit is a
+missing piece here, not the tool itself.
+
+**Accounts**
+- A **GitHub account** to hold your fork.
+- A **Steam account that owns Counter-Strike 2.** A cheap throwaway is fine, but it
+  must be able to log in non-interactively: turn off the **phone-app (mobile) Steam
+  Guard**, because that pops a confirmation prompt every login and automation will
+  just hang. Email Steam Guard is fine. Log into that account once from a desktop
+  Steam client first so it isn't flagged as brand-new on first use.
+
+**The build machine (your self-hosted runner)** — one Linux box you control, that
+stays on. It does the downloading and building, so it needs:
+- **Docker**, with your runner's user able to use it *without sudo* (this is the
+  exact thing that bites most people — see Troubleshooting below).
+- **Python 3** (3.10+), plus `pip`.
+- **git**, **binutils** (`readelf`), **zip**, and **unzip**.
+
+On Ubuntu/Debian that's:
+```bash
+# Docker
+sudo apt-get update && sudo apt-get install -y docker.io
+sudo systemctl enable --now docker
+
+# build/runtime tools
+sudo apt-get install -y python3 python3-pip git binutils zip unzip
+
+# let your login user run docker without sudo (log out/in afterwards)
+sudo usermod -aG docker "$USER"
+```
+The Python libraries the recovery needs (`pyelftools`, `capstone`) are installed
+automatically by the workflow, so you don't have to. You also don't install any C++
+or .NET toolchain by hand — those live inside the Docker images the build pulls.
+
+Once the box is ready, register it as a runner (Setup step 4) and confirm
+everything with the **setup-check** action (Setup step 5) before your first real
+run.
+
 ## Setup for non-experts
 
 You need: a GitHub account, a **Steam account that owns CS2** (a cheap throwaway is
 fine — but it must not require the phone-app Steam Guard prompt, or automation will
 hang; email Guard is OK), and **one Linux machine you control** with Docker
-installed to act as the build runner.
+installed to act as the build runner. See **Prerequisites** above for the full list
+and the install commands.
 
 ### 1. Fork this repo
 Click **Fork** (top-right). Everything below happens in *your* fork.
@@ -178,6 +219,69 @@ with the things that break forks removed:
   uses, no local toolchain to install.
 
 ---
+
+## Troubleshooting
+
+### `docker: permission denied ... /var/run/docker.sock`
+
+The build dies at the "native build" step with something like:
+```
+docker: permission denied while trying to connect to the Docker daemon socket
+at unix:///var/run/docker.sock ... connect: permission denied.
+```
+This is not a bug in the pipeline. Your self-hosted runner runs as an unprivileged
+user, and Docker's socket is only accessible to root and members of the `docker`
+group. Your runner user isn't in that group yet.
+
+Fix it on the runner machine:
+```bash
+# make sure the daemon is installed and running
+sudo systemctl enable --now docker
+docker --version
+
+# add the runner's user to the docker group
+#   run this AS the user the runner service runs as
+sudo usermod -aG docker "$(whoami)"
+#   (if the runner runs as a different user: sudo usermod -aG docker <that-user>)
+
+# restart the runner service so it picks up the new group membership
+cd ~/actions-runner
+sudo ./svc.sh stop
+sudo ./svc.sh start
+```
+Group membership only applies to processes started *after* the change, which is why
+the service restart matters — the still-running listener has the old groups. Verify
+as the runner user (no `sudo`, or you'd mask the problem):
+```bash
+docker info      # should print daemon info with no permission error
+```
+If it still fails after the restart, reboot the box once — a few setups don't hand
+the new group to services until a full boot. Then re-run the workflow.
+
+> Heads-up: being in the `docker` group is effectively root on that machine (anyone
+> who can reach the Docker socket can mount the host filesystem into a container as
+> root). That's normal for a build box, and a good reason to keep this runner
+> dedicated to building rather than sharing it with anything sensitive — it already
+> holds your Steam login, so treat it as a trusted build machine.
+
+To catch this before it wastes a build, the **setup-check** action tests actual
+daemon access (`docker info`), not just that the Docker CLI exists.
+
+### `fatal: detected dubious ownership` / `git describe ... exited with code 128`
+
+You shouldn't see this — the pipeline already whitelists the checkout inside both
+build containers (`git config --global --add safe.directory`), which is what
+CounterStrikeSharp's version-stamping `git describe` needs when it runs as root
+against a repo owned by your host user. It's called out here only so that if you
+ever build the tree **by hand** in a container, you know to add that same line
+before running `dotnet publish`.
+
+### `NU1903` (Newtonsoft.Json vulnerability) or `NU1510` warnings
+
+These are warnings from CounterStrikeSharp's own projects, not errors, and they
+don't stop the build. The pipeline restores only the API project (not the test
+project that pulls the flagged package), so the vulnerability warning shouldn't
+appear in your build at all; if you see the `NU1510` prune note it's harmless.
 
 ## Files
 
