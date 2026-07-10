@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from elftools.elf.elffile import ELFFile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64
-from capstone.x86 import X86_OP_MEM, X86_OP_IMM, X86_REG_RIP
+from capstone.x86 import X86_OP_MEM, X86_OP_IMM, X86_OP_REG, X86_REG_RIP, X86_REG_RSP
 
 
 # --------------------------------------------------------------------------- #
@@ -237,51 +237,114 @@ def scan(binary, sig, limit=None):
 
 
 def _wildcard_positions(ins):
+    """Upstream's convention: keep opcodes, prefixes, ModRM and register
+    encodings literal; wildcard everything that moves between builds -- i.e.
+    every memory-operand displacement (RIP-relative string loads, vtable-call
+    offsets, stack/struct offsets like [rbp-8]) and every immediate (stack-frame
+    sizes, constants, and rel8/rel32 branch targets)."""
     wc = set()
-    raw = ins.bytes
-    for op in ins.operands:
-        if op.type == X86_OP_MEM and op.mem.base == X86_REG_RIP:
-            enc = struct.pack("<I", op.mem.disp & 0xFFFFFFFF)
-            idx = raw.rfind(enc)
-            if idx >= 0:
-                wc.update(range(idx, idx + 4))
-    if ins.mnemonic == "call" or ins.mnemonic.startswith("j"):
-        for op in ins.operands:
-            if op.type == X86_OP_IMM and ins.size >= 5:
-                wc.update(range(ins.size - 4, ins.size))
+    if ins.disp_offset and ins.disp_size:
+        wc.update(range(ins.disp_offset, ins.disp_offset + ins.disp_size))
+    if ins.imm_offset and ins.imm_size:
+        wc.update(range(ins.imm_offset, ins.imm_offset + ins.imm_size))
     return wc
 
 
-def gen_sig(binary, entry_va, max_insns=48, tail_margin=1):
-    off = entry_va - binary.tva
-    code = binary.text[off:off + max_insns * 15]
+def gen_sig(binary, entry_va, max_insns=80, min_anchor_insns=6,
+            min_anchor_bytes=14, robust_margin=2, extend_pad=True):
+    """Cut a MAXIMALLY ROBUST unique signature at entry_va.
+
+    Robustness model: the only bytes that move between builds are operands --
+    displacements, immediates, branch targets (struct offsets shift, frame
+    sizes change, call targets relocate). Those are all wildcarded, so every
+    LITERAL byte in the signature is a stable part of the function: opcode,
+    prefix, ModRM, or register encoding. A signature therefore stays valid as
+    long as the function's own logic is unchanged, and only breaks when the
+    function is genuinely rewritten -- at which point this tool re-derives it.
+
+    Rather than stop at the first coincidental point of uniqueness (which could
+    be a short, weak prefix), the generator keeps extending until the literal
+    skeleton is a genuine anchor: at least `min_anchor_bytes` stable bytes AND
+    `min_anchor_insns` instructions, plus `robust_margin` instructions beyond
+    the first unique point so uniqueness never rests on a single byte. It stays
+    inside the function body whenever possible; it only reaches into
+    inter-function padding + the neighbour when the body can NEVER be unique (a
+    byte-identical twin), and flags that case as fragile.
+
+    Returns (sig, unique, meta) where meta = {insns, literal_bytes, extended,
+    fragile, reason}.
+    """
+    data = binary.text
+    tva = binary.tva
+    ntext = len(data)
+    cur = entry_va - tva
     pat = bytearray()
     mask = bytearray()
     toks = []
     made_unique = None
     used = 0
-    for ins in binary.md.disasm(code, entry_va):
-        if ins.bytes[:1] == b"\xcc":
+    extended = False
+
+    def is_unique():
+        return len(scan_pm(binary, bytes(pat), bytes(mask), 2)) == 1
+
+    def anchor_solid():
+        return (made_unique is not None
+                and sum(mask) >= min_anchor_bytes
+                and used >= min_anchor_insns
+                and used >= made_unique + robust_margin)
+
+    while used < max_insns and cur < ntext:
+        if data[cur] == 0xCC:
+            # reached the function's end (inter-function padding)
+            if made_unique is not None:
+                break                          # already unique inside the body
+            if not extend_pad:
+                break
+            # Byte-identical twin: the body alone can never disambiguate. Reach
+            # into the padding + neighbour just far enough to become unique, and
+            # no further -- extra neighbour bytes only add neighbour-dependent
+            # fragility without helping.
+            while cur < ntext and data[cur] == 0xCC:
+                pat.append(0xCC); mask.append(1); toks.append("CC"); cur += 1
+            extended = True
+            if is_unique():
+                made_unique = used
+                break
+            continue                           # fall into the next function
+        insn = next(binary.md.disasm(data[cur:cur + 15], tva + cur), None)
+        if insn is None:
             break
-        wc = _wildcard_positions(ins)
-        for k, b in enumerate(ins.bytes):
+        wc = _wildcard_positions(insn)
+        for k, b in enumerate(insn.bytes):
             if k in wc:
                 pat.append(0); mask.append(0); toks.append("?")
             else:
                 pat.append(b); mask.append(1); toks.append("%02X" % b)
         used += 1
-        if len(scan_pm(binary, bytes(pat), bytes(mask), 2)) == 1:
-            if made_unique is None:
-                made_unique = used
-            if used >= made_unique + tail_margin:
-                break
-        if used >= max_insns:
+        cur += len(insn.bytes)
+        if made_unique is None and is_unique():
+            made_unique = used
+        if extended and is_unique():
+            break                              # twin: minimal neighbour reach
+        if anchor_solid():
             break
+
     while toks and toks[-1] == "?":
         toks.pop(); pat.pop(); mask.pop()
-    sig = " ".join(toks)
+
     unique = len(scan_pm(binary, bytes(pat), bytes(mask), 2)) == 1
-    return sig, unique
+    lit = sum(mask)
+    meta = {
+        "insns": used,
+        "literal_bytes": lit,
+        "extended": extended,
+        "fragile": bool(extended or lit < min_anchor_bytes),
+        "reason": ("byte-identical twin: relies on neighbour layout" if extended
+                   else ("short anchor: only %d stable bytes available" % lit
+                         if lit < min_anchor_bytes else "")),
+    }
+    return " ".join(toks), unique, meta
 
 
 def scan_pm(binary, pat, mask, limit):
@@ -590,15 +653,23 @@ def main():
             continue
         old_hits = scan(old, sig, limit=8)
         if len(new_hits) > 1 and len(old_hits) > 1:
-            # Ambiguous in both builds. Try to disambiguate to the true instance
-            # and cut a UNIQUE sig (this is what upstream did for e.g.
-            # GetCSWeaponDataFromKey). Only if that fails -- genuine byte-identical
-            # twins -- leave it unchanged, since CSS relies on first-match there.
-            rec = recover_signature(old, new, name, old_hits, sig, args.min_cos)
-            if rec["status"] == "REPAIRED":
-                report["signatures"][name] = rec
-                entry["signatures"]["linux"] = rec["new_sig"]
+            # Byte-identical twins. CSS resolves the sig to the FIRST match, so
+            # target that instance and extend the sig past the function end
+            # (into padding + the next function) until it is unique. This works,
+            # but such a sig depends on the neighbour's layout, so it is
+            # inherently more fragile and always surfaced for review.
+            target = new_hits[0]
+            xsig, uniq, xmeta = gen_sig(new, target)
+            xhits = scan(new, xsig, limit=3)
+            if uniq and len(xhits) == 1 and xhits[0] == target:
+                report["signatures"][name] = {
+                    "status": "REPAIRED", "method": "twin-extend",
+                    "confidence": "medium",
+                    "new_addr": "0x%x" % target, "new_sig": xsig,
+                    "review": xmeta["reason"] or "byte-identical twin"}
+                entry["signatures"]["linux"] = xsig
                 changed += 1
+                needs_review += 1
             else:
                 report["signatures"][name] = {
                     "status": "AMBIGUOUS_BY_DESIGN", "matches": len(new_hits),
@@ -609,6 +680,8 @@ def main():
         if rec["status"] == "REPAIRED":
             entry["signatures"]["linux"] = rec["new_sig"]
             changed += 1
+            if rec.get("confidence") == "low":
+                needs_review += 1
         elif len(new_hits) == 0:
             needs_review += 1
 
@@ -831,7 +904,8 @@ def recover_via_old_anchor(old, new, old_addr, old_sig, min_cos):
     cheap, tight sources: (a) the new addresses where the exact old sig still
     matches (the ambiguous multi-match set), and (b) a relaxed old-entry prefix
     scanned in new. Both are then CFG-ranked against the old function. This is
-    far less decoy-prone than the global CFG sweep, so it runs first."""
+    far less decoy-prone than the global CFG sweep, so it runs first. Returns
+    (best_entry, best_cosine, margin_over_runner_up)."""
     cands = set()
     for a in scan(new, old_sig, limit=8):
         e = new.containing_entry(a)
@@ -841,16 +915,90 @@ def recover_via_old_anchor(old, new, old_addr, old_sig, min_cos):
         for a in scan(new, pat, limit=60):
             cands.add(a)
     if not cands:
-        return None, 0.0
+        return None, 0.0, 1.0
     of = old.fingerprint(old_addr)
-    best = (None, -1.0)
-    for e in cands:
-        c = mnem_cos(of["mnem"], new.fingerprint(e)["mnem"])
-        if c > best[1]:
-            best = (e, c)
-    if best[0] is not None and best[1] >= min_cos:
-        return best
-    return None, 0.0
+    ranked = sorted(
+        ((mnem_cos(of["mnem"], new.fingerprint(e)["mnem"]), e) for e in cands),
+        reverse=True)
+    best_c, best_e = ranked[0]
+    margin = (best_c - ranked[1][0]) if len(ranked) > 1 else 1.0
+    if best_c >= min_cos:
+        return best_e, best_c, margin
+    return None, 0.0, margin
+
+
+def corroborate(old, new, old_addr, cand, cosine, margin, of=None):
+    """Independently confirm that NEW `cand` really is the OLD function at
+    old_addr, using signals that did NOT drive the original selection: retained
+    size, referenced strings, called functions, block count, and how clearly
+    the candidate beat the runner-up. Returns a confidence tier + notes. This is
+    what turns a lucky-looking cosine into a trustworthy match: a decoy rarely
+    keeps the same size AND strings AND callees AND block count as the original."""
+    of = of or old.fingerprint(old_addr)
+    nf = new.fingerprint(cand)
+    notes = []
+    passed = 0
+    total = 0
+
+    total += 1                                          # 1) size stability
+    sr = nf["size"] / max(1, of["size"])
+    if 0.82 <= sr <= 1.22:
+        passed += 1
+    else:
+        notes.append("size x%.2f" % sr)
+
+    total += 1                                          # 2) block-count
+    db = abs(nf["blocks"] - of["blocks"])
+    if db <= 8:
+        passed += 1
+    else:
+        notes.append("dblocks %d" % db)
+
+    os_ = set(distinctive(of["strings"]))               # 3) referenced strings
+    if os_:
+        total += 1
+        overlap = len(os_ & set(nf["strings"])) / len(os_)
+        if overlap >= 0.5:
+            passed += 1
+        else:
+            notes.append("strings %d%%" % int(100 * overlap))
+
+    oc = [t for t in call_targets(old, old_addr) if old.in_text(t)]
+    if oc:                                              # 4) callee corroboration
+        total += 1
+        ncf = [new.fingerprint(t) for t in call_targets(new, cand)[:10]
+               if new.in_text(t)]
+        matched = 0
+        for t in oc[:8]:
+            ofp = old.fingerprint(t)
+            if any(mnem_cos(ofp["mnem"], x["mnem"]) >= 0.95 for x in ncf):
+                matched += 1
+        denom = min(8, len(oc)) or 1
+        if matched / denom >= 0.5:
+            passed += 1
+        else:
+            notes.append("callees %d/%d" % (matched, denom))
+
+    tie = margin is not None and margin < 0.02          # decoy risk
+    if tie:
+        notes.append("near-tie dcos %.3f" % margin)
+
+    frac = passed / total if total else 0.0
+    full = (passed == total and total >= 3)
+    if full and cosine >= 0.95:
+        # every independent axis agrees -- size, blocks, strings, callees.
+        # That disambiguates even a cosine near-tie, so it's trustworthy.
+        conf = "high"
+    elif cosine >= 0.995 and 0.9 <= sr <= 1.12 and not tie:
+        conf = "high"
+    elif frac >= 0.75 and cosine >= 0.95 and not tie:
+        conf = "high"
+    elif frac >= 0.5 and cosine >= 0.92:
+        conf = "medium"
+    else:
+        conf = "low"
+    return {"confidence": conf, "checks": "%d/%d" % (passed, total),
+            "size_ratio": round(sr, 3), "notes": notes}
 
 
 def recover_signature(old, new, name, old_hits, old_sig, min_cos):
@@ -866,13 +1014,14 @@ def recover_signature(old, new, name, old_hits, old_sig, min_cos):
     candidate = None
     method = None
     cand_cos = 0.0
+    cand_margin = 1.0
     # STAGE 0: old-anchored re-resolution. Handles the common "function barely
     # changed but the exact old sig no longer resolves to exactly one" case
     # (a changed tail instruction, or an ambiguous twin) precisely and cheaply,
     # before the decoy-prone global CFG search.
-    e, c = recover_via_old_anchor(old, new, old_addr, old_sig, min_cos)
+    e, c, m = recover_via_old_anchor(old, new, old_addr, old_sig, min_cos)
     if e is not None:
-        candidate, method, cand_cos = e, "old-anchor", c
+        candidate, method, cand_cos, cand_margin = e, "old-anchor", c, m
     if candidate is None and anchors:
         hits = locate_by_strings(new, anchors)
         if hits:
@@ -888,11 +1037,13 @@ def recover_signature(old, new, name, old_hits, old_sig, min_cos):
             best_c, _, best_e = scored[0]
             if best_c >= min_cos:
                 candidate, method, cand_cos = best_e, "string+cfg", best_c
+                cand_margin = (best_c - scored[1][0]) if len(scored) > 1 else 1.0
     if candidate is None:
         # fall back to pure CFG search, prescreened by a cheap size estimate so
         # we don't fingerprint all ~38k functions.
         target_size = of["size"]
         best = (None, -1.0)
+        second = -1.0
         checked = 0
         for e in new.entries():
             est = estimate_size(new, e)
@@ -906,9 +1057,13 @@ def recover_signature(old, new, name, old_hits, old_sig, min_cos):
                 continue
             c = mnem_cos(of["mnem"], nf["mnem"])
             if c > best[1]:
+                second = best[1]
                 best = (e, c)
+            elif c > second:
+                second = c
         if best[0] is not None and best[1] >= max(min_cos, 0.99):
             candidate, method, cand_cos = best[0], "cfg", best[1]
+            cand_margin = best[1] - second if second >= 0 else 1.0
 
     if candidate is None:
         # last resort for stringless wrappers: anchor on a distinctive callee
@@ -938,15 +1093,27 @@ def recover_signature(old, new, name, old_hits, old_sig, min_cos):
         if c2 >= base_c - 0.001:
             candidate, cand_cos = e2, c2
 
-    sig, unique = gen_sig(new, candidate)
+    sig, unique, meta = gen_sig(new, candidate)
     hits = scan(new, sig, limit=3)
     if not (unique and len(hits) == 1 and hits[0] == candidate):
         return {"status": "BROKEN", "reason": "could not cut unique sig",
                 "new_addr": "0x%x" % candidate}
-    return {"status": "REPAIRED", "method": method,
-            "old_addr": "0x%x" % old_addr, "new_addr": "0x%x" % candidate,
-            "cosine": round(cand_cos, 4),
-            "new_sig": sig}
+
+    # Independent cross-check: does this candidate actually look like the old
+    # function on axes the selection didn't use? This is the rock-solid gate.
+    corr = corroborate(old, new, old_addr, candidate, cand_cos, cand_margin, of)
+    out = {"status": "REPAIRED", "method": method,
+           "old_addr": "0x%x" % old_addr, "new_addr": "0x%x" % candidate,
+           "cosine": round(cand_cos, 4),
+           "confidence": corr["confidence"],
+           "corroboration": corr["checks"],
+           "new_sig": sig}
+    detail = list(corr["notes"])
+    if meta["fragile"]:
+        detail.append(meta["reason"])
+    if detail:
+        out["review"] = "; ".join(detail)
+    return out
 
 
 if __name__ == "__main__":
