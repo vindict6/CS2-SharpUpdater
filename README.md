@@ -1,5 +1,4 @@
 # CS2-SharpUpdater
-https://buymeacoffee.com/theboneman
 
 **Keep your CounterStrikeSharp server working the moment Counter-Strike 2 updates —
 automatically.**
@@ -67,8 +66,11 @@ missing piece here, not the tool itself.
 
 **Accounts**
 - A **GitHub account** to hold your fork.
-- A **Steam account that owns Counter-Strike 2.** If you use Steam Guard, make sure
-  you have your phone out and ready during the workflows with the Steam app open.
+- A **Steam account that owns Counter-Strike 2.** A cheap throwaway is fine, but it
+  must be able to log in non-interactively: turn off the **phone-app (mobile) Steam
+  Guard**, because that pops a confirmation prompt every login and automation will
+  just hang. Email Steam Guard is fine. Log into that account once from a desktop
+  Steam client first so it isn't flagged as brand-new on first use.
 
 **The build machine (your self-hosted runner)** — one Linux box you control, that
 stays on. It does the downloading and building, so it needs:
@@ -99,7 +101,11 @@ run.
 
 ## Setup for non-experts
 
-You need: a GitHub account, a **Steam account that owns CS2**
+You need: a GitHub account, a **Steam account that owns CS2** (a cheap throwaway is
+fine — but it must not require the phone-app Steam Guard prompt, or automation will
+hang; email Guard is OK), and **one Linux machine you control** with Docker
+installed to act as the build runner. See **Prerequisites** above for the full list
+and the install commands.
 
 ### 1. Fork this repo
 Click **Fork** (top-right). Everything below happens in *your* fork.
@@ -187,6 +193,7 @@ Set these as workflow inputs (manual runs) or edit `update.yml`:
 | `css_ref` | CounterStrikeSharp tag/branch to build | `main` |
 | `old_manifest` / `new_manifest` | depot manifest IDs (manifest mode) | — |
 | `publish_release` | create a GitHub Release | `true` |
+| `with_runtime` | bundle the .NET runtime into the zip (off = server must already have the runtime installed) | `true` |
 
 Inside `tools/run_pipeline.sh`: `DOTNET_TAG` and `ASPNET_RUNTIME` — match these to
 the CSS version you build (upstream `main` currently uses .NET 10; older tags use
