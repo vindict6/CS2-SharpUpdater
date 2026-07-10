@@ -13,8 +13,8 @@ name: update
 #     the whole pipeline end-to-end without waiting for a real update.
 
 on:
-  schedule:
-    #- cron: "*/30 * * * *"
+  #schedule:
+  #  - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -47,7 +47,7 @@ jobs:
   update:
     runs-on: [self-hosted]        # must have Steam access + Docker
     env:
-      WORK: ${{ runner.temp }}/csu-work
+      WORK: ${{ github.workspace }}/../csu-work
       OUT: ${{ github.workspace }}/out
       STATE: ${{ github.workspace }}/../csu-state    # persists across runs on the box
       MODE: ${{ inputs.mode || 'baseline' }}
@@ -77,11 +77,10 @@ jobs:
       - name: Run pipeline (RE + SDK bump + build)
         id: build
         if: steps.fetch.outputs.UPDATE == 'true'
-        env:
-          OLD_SO: ${{ env.WORK }}/libserver.old.so
-          NEW_SO: ${{ env.WORK }}/libserver.new.so
         run: |
           chmod +x tools/run_pipeline.sh
+          export OLD_SO="$WORK/libserver.old.so"
+          export NEW_SO="$WORK/libserver.new.so"
           tools/run_pipeline.sh
           echo "VERSION=$(cat "$OUT/VERSION")" >> "$GITHUB_OUTPUT"
 
@@ -114,7 +113,7 @@ jobs:
             out/recovery-report.json
 
       - name: Promote baseline (baseline mode, successful build only)
-        if: steps.build.outcome == 'success' && env.MODE == 'baseline'
+        if: steps.build.outcome == 'success' && (github.event_name == 'schedule' || inputs.mode == 'baseline')
         run: |
           mkdir -p "$STATE"
           cp "$WORK/libserver.new.so" "$STATE/libserver.prev.so"
