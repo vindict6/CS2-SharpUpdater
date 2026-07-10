@@ -55,6 +55,11 @@ jobs:
     steps:
       - name: Checkout updater
         uses: actions/checkout@v4
+      - name: Wipe scratch work dir (clears root-owned Docker leftovers)
+        run: |
+          sudo rm -rf "$WORK" 2>/dev/null || rm -rf "$WORK" || true
+          rm -rf "$OUT" 2>/dev/null || true
+          mkdir -p "$WORK" "$OUT"
 
       - name: Tooling
         run: |
