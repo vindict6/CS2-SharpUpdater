@@ -19,6 +19,8 @@
 #   SDK_REF              hl2sdk-cs2 commit/branch to pin (default: cs2 head)
 #   DOTNET_TAG           dotnet SDK image tag (default: 10.0)
 #   ASPNET_RUNTIME       aspnetcore runtime version to bundle (default: 10.0.3)
+#   BUNDLE_RUNTIME       1 = bundle the .NET runtime into the zip (default),
+#                        0 = skip it (smaller zip; server must supply the runtime)
 #   WORK                 work dir
 #   OUT                  output dir for zips/report
 set -euo pipefail
@@ -99,14 +101,21 @@ else
 fi
 
 echo "==> [6/6] bundle runtime + zip"
-mkdir -p "$WORK/dist/addons/counterstrikesharp/dotnet"
-curl -sSL "https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/${ASPNET_RUNTIME}/aspnetcore-runtime-${ASPNET_RUNTIME}-linux-x64.tar.gz" \
-  | tar xz -C "$WORK/dist/addons/counterstrikesharp/dotnet"
-
 NEW_ID="$(readelf -n "$NEW_SO" 2>/dev/null | grep -oiE 'Build ID: [0-9a-f]+' | awk '{print $3}')"
 VER="${CSS_REF}+cs2.${NEW_ID:0:8}.$(date -u +%Y%m%d)"
 echo "$VER" > "$OUT/VERSION"
-ZIP="$OUT/counterstrikesharp-with-runtime-linux-${VER}.zip"
+
+if [ "${BUNDLE_RUNTIME:-1}" = "1" ]; then
+  echo "    bundling .NET runtime (aspnetcore ${ASPNET_RUNTIME})"
+  mkdir -p "$WORK/dist/addons/counterstrikesharp/dotnet"
+  curl -sSL "https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/${ASPNET_RUNTIME}/aspnetcore-runtime-${ASPNET_RUNTIME}-linux-x64.tar.gz" \
+    | tar xz -C "$WORK/dist/addons/counterstrikesharp/dotnet"
+  ZIP="$OUT/counterstrikesharp-with-runtime-linux-${VER}.zip"
+else
+  echo "    skipping .NET runtime (BUNDLE_RUNTIME=0) - server must have the runtime installed"
+  ZIP="$OUT/counterstrikesharp-linux-${VER}.zip"
+fi
+
 ( cd "$WORK/dist" && zip -qq -r "$ZIP" addons )
 echo "    wrote $ZIP"
 echo "    version $VER"
