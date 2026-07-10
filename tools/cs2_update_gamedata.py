@@ -455,6 +455,64 @@ def _vtable_functions(binary, class_name):
     return None
 
 
+def reconcile_offsets(old, new, resolved, report):
+    """Vtable indices preserve their relative order across builds (edits are
+    insertions/removals that shift a suffix). So within one class the recovered
+    new indices must increase with the old indices. A weak CFG match that breaks
+    that ordering is almost certainly a decoy; re-derive it from the consistent
+    delta of its high-confidence siblings and re-score at that slot. This is what
+    rescues e.g. RemoveWeapons: siblings shifted +3 (21->24, 24->27), so old 25
+    must be 28, not a same-looking decoy at 23."""
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for r in resolved:
+        groups[r["cls"]].append(r)
+    fixed = 0
+    for cls, items in groups.items():
+        if len(items) < 2:
+            continue
+        items.sort(key=lambda r: r["old_idx"])
+        anchors = [r for r in items if r["cos"] >= 0.98]
+        if not anchors:
+            continue
+        for r in items:
+            lower = [a for a in anchors if a["old_idx"] < r["old_idx"]]
+            upper = [a for a in anchors if a["old_idx"] > r["old_idx"]]
+            lo = max((a["new_idx"] for a in lower), default=-1)
+            hi = min((a["new_idx"] for a in upper), default=1 << 30)
+            monotonic = lo < r["new_idx"] < hi
+            if monotonic and r["cos"] >= 0.97:
+                continue                      # consistent and confident enough
+            # derive the expected slot from the nearest anchor's delta
+            if lower:
+                a = max(lower, key=lambda x: x["old_idx"])
+                expected = a["new_idx"] + (r["old_idx"] - a["old_idx"])
+            else:
+                a = min(upper, key=lambda x: x["old_idx"])
+                expected = a["new_idx"] - (a["old_idx"] - r["old_idx"])
+            nf = r["new_funcs"]
+            if not (0 <= expected < len(nf)) or not (lo < expected < hi):
+                continue
+            if expected == r["new_idx"]:
+                continue
+            of = old.fingerprint(r["old_funcs"][r["old_idx"]])
+            cexp = mnem_cos(of["mnem"], new.fingerprint(nf[expected])["mnem"])
+            if cexp < 0.85:
+                continue                      # don't trust the correction either
+            was = r["new_idx"]
+            r["new_idx"] = expected
+            r["entry"]["offsets"]["linux"] = expected
+            rep = report["offsets"][r["name"]]
+            rep["status"] = "OK" if expected == r["old_idx"] else "REPAIRED"
+            rep["new_index"] = expected
+            rep["cosine"] = round(cexp, 4)
+            rep["reconciled"] = ("snapped to sibling delta +%d (was %d, cos %.3f)"
+                                 % (expected - r["old_idx"], was, cexp))
+            rep.pop("review", None)
+            fixed += 1
+    return fixed
+
+
 def recover_vtable_index(old, new, old_funcs, new_funcs, old_idx, band=8):
     """Given the old function at old_idx, find its new index via CFG match in a
     band around old_idx. Returns (new_idx, cosine) or (None, 0)."""
@@ -530,16 +588,22 @@ def main():
         if len(new_hits) == 1:
             report["signatures"][name] = {"status": "OK"}
             continue
-        old_hits = scan(old, sig, limit=3)
-        if len(new_hits) > 1:
-            # ambiguous, not broken. If it was ALSO ambiguous in old, leave it -
-            # CSS has always used first-match here; don't manufacture uniqueness.
-            if len(old_hits) > 1:
-                report["signatures"][name] = {"status": "AMBIGUOUS_BY_DESIGN",
-                                              "matches": len(new_hits),
-                                              "note": "ambiguous in old build too; left unchanged"}
-                continue
-            # became ambiguous this update: tighten to the correct instance
+        old_hits = scan(old, sig, limit=8)
+        if len(new_hits) > 1 and len(old_hits) > 1:
+            # Ambiguous in both builds. Try to disambiguate to the true instance
+            # and cut a UNIQUE sig (this is what upstream did for e.g.
+            # GetCSWeaponDataFromKey). Only if that fails -- genuine byte-identical
+            # twins -- leave it unchanged, since CSS relies on first-match there.
+            rec = recover_signature(old, new, name, old_hits, sig, args.min_cos)
+            if rec["status"] == "REPAIRED":
+                report["signatures"][name] = rec
+                entry["signatures"]["linux"] = rec["new_sig"]
+                changed += 1
+            else:
+                report["signatures"][name] = {
+                    "status": "AMBIGUOUS_BY_DESIGN", "matches": len(new_hits),
+                    "note": "ambiguous in old build too; left unchanged"}
+            continue
         rec = recover_signature(old, new, name, old_hits, sig, args.min_cos)
         report["signatures"][name] = rec
         if rec["status"] == "REPAIRED":
@@ -549,6 +613,7 @@ def main():
             needs_review += 1
 
     # ---------------- offsets ----------------
+    resolved_off = []
     for name, entry in gd.items():
         if "offsets" not in entry or "linux" not in entry["offsets"]:
             continue
@@ -581,6 +646,12 @@ def main():
                                        "old_index": old_idx,
                                        "candidate_index": new_idx,
                                        "cosine": round(cos, 4)}
+            # still record it so reconciliation can try to place it by siblings
+            if new_idx is not None:
+                resolved_off.append({"name": name, "entry": entry, "cls": cls,
+                                     "old_idx": old_idx, "new_idx": new_idx,
+                                     "cos": cos, "old_funcs": old_funcs,
+                                     "new_funcs": new_funcs})
             needs_review += 1
             continue
         status = "OK" if new_idx == old_idx else "REPAIRED"
@@ -591,9 +662,23 @@ def main():
             rec["review"] = "borderline cosine; verify on server"
             needs_review += 1
         report["offsets"][name] = rec
+        resolved_off.append({"name": name, "entry": entry, "cls": cls,
+                             "old_idx": old_idx, "new_idx": new_idx, "cos": cos,
+                             "old_funcs": old_funcs, "new_funcs": new_funcs})
         if new_idx != old_idx:
             entry["offsets"]["linux"] = new_idx
             changed += 1
+
+    # cross-check each class for vtable-order consistency and fix decoys
+    reconcile_offsets(old, new, resolved_off, report)
+    # recompute after reconciliation (some 'review' flags may have cleared, some
+    # entries may have flipped OK<->REPAIRED)
+    changed = (sum(1 for v in report["signatures"].values() if v["status"] == "REPAIRED")
+               + sum(1 for v in report["offsets"].values() if v["status"] == "REPAIRED"))
+    needs_review = (sum(1 for v in report["offsets"].values()
+                        if v.get("status") == "LOW_CONFIDENCE" or "review" in v)
+                    + sum(1 for v in report["signatures"].values()
+                          if v["status"] in ("BROKEN", "AMBIGUOUS")))
 
     report["summary"] = {
         "changed": changed,
@@ -711,6 +796,63 @@ def recover_via_callees(old, new, old_addr, min_cos):
     return None, 0.0
 
 
+def relaxed_entry_pattern(binary, entry, max_ins=10, min_literal=12):
+    """Build a byte pattern from a function's leading instructions with all
+    displacement and immediate bytes wildcarded, keeping opcode/prefix/ModRM.
+    This survives the two things that change most across a recompile -- moved
+    string/branch targets and a single altered tail instruction -- so it still
+    matches a function that barely changed. Deliberately NOT required to be
+    unique: it produces a small candidate pool that CFG then ranks."""
+    off = entry - binary.tva
+    code = binary.text[off:off + 96]
+    toks = []
+    literal = 0
+    n = 0
+    for ins in binary.md.disasm(code, entry):
+        wild = set()
+        if ins.disp_offset and ins.disp_size:
+            wild.update(range(ins.disp_offset, ins.disp_offset + ins.disp_size))
+        if ins.imm_offset and ins.imm_size:
+            wild.update(range(ins.imm_offset, ins.imm_offset + ins.imm_size))
+        for i, by in enumerate(ins.bytes):
+            if i in wild:
+                toks.append("?")
+            else:
+                toks.append("%02X" % by)
+                literal += 1
+        n += 1
+        if n >= max_ins or literal >= min_literal:
+            break
+    return " ".join(toks) if literal >= min_literal else None
+
+
+def recover_via_old_anchor(old, new, old_addr, old_sig, min_cos):
+    """Re-resolve a function that barely changed. Candidates come from two
+    cheap, tight sources: (a) the new addresses where the exact old sig still
+    matches (the ambiguous multi-match set), and (b) a relaxed old-entry prefix
+    scanned in new. Both are then CFG-ranked against the old function. This is
+    far less decoy-prone than the global CFG sweep, so it runs first."""
+    cands = set()
+    for a in scan(new, old_sig, limit=8):
+        e = new.containing_entry(a)
+        cands.add(e if e is not None else a)
+    pat = relaxed_entry_pattern(old, old_addr)
+    if pat:
+        for a in scan(new, pat, limit=60):
+            cands.add(a)
+    if not cands:
+        return None, 0.0
+    of = old.fingerprint(old_addr)
+    best = (None, -1.0)
+    for e in cands:
+        c = mnem_cos(of["mnem"], new.fingerprint(e)["mnem"])
+        if c > best[1]:
+            best = (e, c)
+    if best[0] is not None and best[1] >= min_cos:
+        return best
+    return None, 0.0
+
+
 def recover_signature(old, new, name, old_hits, old_sig, min_cos):
     """Locate the function in NEW and regenerate a unique sig."""
     if len(old_hits) != 1:
@@ -724,7 +866,14 @@ def recover_signature(old, new, name, old_hits, old_sig, min_cos):
     candidate = None
     method = None
     cand_cos = 0.0
-    if anchors:
+    # STAGE 0: old-anchored re-resolution. Handles the common "function barely
+    # changed but the exact old sig no longer resolves to exactly one" case
+    # (a changed tail instruction, or an ambiguous twin) precisely and cheaply,
+    # before the decoy-prone global CFG search.
+    e, c = recover_via_old_anchor(old, new, old_addr, old_sig, min_cos)
+    if e is not None:
+        candidate, method, cand_cos = e, "old-anchor", c
+    if candidate is None and anchors:
         hits = locate_by_strings(new, anchors)
         if hits:
             # Cosine is ground truth; anchors only narrow the candidate pool.
