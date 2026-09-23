@@ -124,9 +124,12 @@ jobs:
             || python3 -m pip install --user --upgrade pyelftools capstone
           python3 -c "import elftools, capstone; print('pyelftools', elftools.__version__, 'capstone', capstone.__version__)"
 
-          # --- required CLI tools ---
-          for t in git readelf zip unzip curl docker; do
-            command -v "$t" >/dev/null || { echo "::error::'$t' is missing and could not be installed (no passwordless sudo). Install it on the runner: sudo apt-get install -y git binutils zip unzip curl docker.io"; exit 1; }
+          # --- required CLI tools (readelf/zip/unzip have python fallbacks) ---
+          for t in git curl docker; do
+            command -v "$t" >/dev/null || { echo "::error::'$t' is missing and could not be installed (no passwordless sudo). Install it on the runner: sudo apt-get install -y git curl docker.io"; exit 1; }
+          done
+          for t in readelf zip unzip; do
+            command -v "$t" >/dev/null || echo "::notice::'$t' not found; using the python fallback"
           done
           docker --version
 

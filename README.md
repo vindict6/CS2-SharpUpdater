@@ -96,7 +96,8 @@ stays on. It does the downloading and building, so it needs:
 - **Docker**, with your runner's user able to use it *without sudo* (this is the
   exact thing that bites most people — see Troubleshooting below).
 - **Python 3** (3.10+), plus `pip`.
-- **git**, **binutils** (`readelf`), **zip**, and **unzip**.
+- **git** and **curl**. (`zip`/`unzip`/`readelf` are nice to have; the pipeline
+  falls back to Python when they are absent.)
 
 On Ubuntu/Debian that's:
 ```bash

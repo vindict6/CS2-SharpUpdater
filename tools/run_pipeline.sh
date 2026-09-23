@@ -135,7 +135,7 @@ else
 fi
 
 echo "==> [7/7] bundle runtime + zip"
-NEW_ID="$(readelf -n "$NEW_SO" 2>/dev/null | grep -oiE 'Build ID: [0-9a-f]+' | awk '{print $3}')"
+NEW_ID="$(python3 "$HERE/buildid.py" "$NEW_SO")"
 VER="${CSS_REF}+cs2.${NEW_ID:0:8}.$(date -u +%Y%m%d)"
 echo "$VER" > "$OUT/VERSION"
 
@@ -150,7 +150,11 @@ else
   ZIP="$OUT/counterstrikesharp-linux-${VER}.zip"
 fi
 
-( cd "$WORK/dist" && zip -qq -r "$ZIP" addons )
+if command -v zip >/dev/null; then
+  ( cd "$WORK/dist" && zip -qq -r "$ZIP" addons )
+else
+  python3 -c "import shutil,sys; shutil.make_archive(sys.argv[1][:-4], 'zip', root_dir=sys.argv[2], base_dir='addons')" "$ZIP" "$WORK/dist"
+fi
 echo "    wrote $ZIP"
 echo "    version $VER"
 echo "PIPELINE_OK"

@@ -32,7 +32,7 @@ FILE="game/csgo/bin/linuxsteamrt64/libserver.so"
 : "${STEAM_PASS:?set STEAM_PASS}"
 
 out() { echo "$1" >> "${GITHUB_OUTPUT:-/dev/stdout}"; }
-buildid() { readelf -n "$1" 2>/dev/null | grep -oiE 'Build ID: [0-9a-f]+' | awk '{print $3}'; }
+buildid() { python3 "$(dirname "$0")/buildid.py" "$1"; }
 
 # ---- locate / install DepotDownloader ----
 DD="${DEPOTDOWNLOADER:-}"
