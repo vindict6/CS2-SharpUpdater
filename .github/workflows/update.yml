@@ -2,8 +2,8 @@ name: update
 
 # CS2-SharpUpdater main pipeline.
 # On a CS2 update (or on demand), fetch old+new libserver.so, recover the CSS
-# gamedata via reverse engineering, bump the native SDK, build CounterStrikeSharp,
-# and publish a ready-to-deploy release.
+# gamedata via reverse engineering, bump the native SDK + Metamod:Source
+# submodules, build CounterStrikeSharp, and publish a ready-to-deploy release.
 #
 # TWO WAYS TO RUN:
 #   * scheduled / automatic  - baseline mode: diffs the current build against the
@@ -25,6 +25,12 @@ on:
       css_ref:
         description: "CounterStrikeSharp ref/tag to build (e.g. v1.0.305 or main)"
         default: "main"
+      sdk_ref:
+        description: "hl2sdk-cs2 commit/branch to pin (native engine ABI)"
+        default: "cs2"
+      mms_ref:
+        description: "metamod-source commit/branch to pin (plugin API; master = current Metamod:Source dev build)"
+        default: "master"
       old_manifest:
         description: "manifest mode: OLD depot 2347773 manifest ID"
         default: ""
@@ -56,6 +62,8 @@ jobs:
       STATE: ${{ github.workspace }}/../csu-state    # persists across runs on the box
       MODE: ${{ inputs.mode || 'baseline' }}
       CSS_REF: ${{ inputs.css_ref || 'main' }}
+      SDK_REF: ${{ inputs.sdk_ref || 'cs2' }}
+      MMS_REF: ${{ inputs.mms_ref || 'master' }}
     steps:
       - name: Wipe scratch work dir (clears root-owned Docker leftovers)
         run: |

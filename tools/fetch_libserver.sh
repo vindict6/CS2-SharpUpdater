@@ -46,7 +46,8 @@ if [ -z "$DD" ]; then
       | grep -oE 'https://[^"]*DepotDownloader-linux-x64\.zip' | head -1)
     [ -n "$URL" ] || { echo "ERROR: cannot find DepotDownloader release"; exit 1; }
     curl -fsSL "$URL" -o "$WORK/dd.zip"
-    unzip -o "$WORK/dd.zip" -d "$STATE/depotdownloader" >/dev/null
+    unzip -o "$WORK/dd.zip" -d "$STATE/depotdownloader" >/dev/null 2>&1 \
+      || python3 -m zipfile -e "$WORK/dd.zip" "$STATE/depotdownloader"
     chmod +x "$STATE/depotdownloader/DepotDownloader" 2>/dev/null || true
     DD="$STATE/depotdownloader/DepotDownloader"
   fi

@@ -27,7 +27,9 @@ On a schedule (or on demand) the `update` workflow:
 1. **Fetches** the current `libserver.so` from the CS2 dedicated-server depot, and
    uses the previous run's binary as the "before" copy.
 2. If the game changed, **clones official CounterStrikeSharp** at a ref you choose.
-3. **Bumps `hl2sdk-cs2`** to the current `cs2` branch head (fixes the native ABI).
+3. **Bumps `hl2sdk-cs2`** to the current `cs2` branch head (fixes the native ABI)
+   and **`metamod-source`** to the current `master` head (tracks the Metamod:Source
+   plugin API — dev builds like 2.0.0-git1469 are cut straight from `master`).
 4. **Reverse-engineers the gamedata**: for every broken signature it re-locates the
    function in the new binary using three mutually-confirming signals — the strings
    the function references, its control-flow-graph fingerprint (block/edge/mnemonic
@@ -57,6 +59,22 @@ be dropped on a **test server first** — but in practice the recovery is accura
   does), those come from the CSS maintainers. If the build fails to compile after a
   bump, that's the signal to wait for (or merge) an upstream fix.
 - **Linux only.** Windows signatures/offsets are not touched.
+
+### Metamod:Source build 1469+ (plugin API 18 / KHook)
+
+Metamod:Source `master` from 2026-09-08 (dev builds ~1454 and up, including
+**2.0.0-git1469**) removed SourceHook in favour of KHook and raised the plugin
+API to **18**, which is also the new *minimum* — a CounterStrikeSharp binary built
+against the old API (every tagged release up to and including `v1.0.374`) is
+refused by the new Metamod with `Plugin uses old SourceHook Metamod build`.
+Upstream migrated to KHook in `main` on 2026-09-23 (PR #1418), so:
+
+- build `css_ref: main` (or any later ref) for a server running Metamod build
+  1469+; the pipeline bumps `metamod-source` to `master` so the build always
+  targets the current API, and refuses (with a clear error) to combine a
+  pre-KHook CSS ref with an API-18 Metamod;
+- to build an older CSS tag for an older Metamod, pin `mms_ref` to a
+  `metamod-source` commit before `0cc4e200`.
 
 ---
 
@@ -192,13 +210,17 @@ Set these as workflow inputs (manual runs) or edit `update.yml`:
 |---|---|---|
 | `mode` | `baseline` (auto-diff) or `manifest` (pinned test) | `baseline` |
 | `css_ref` | CounterStrikeSharp tag/branch to build | `main` |
+| `sdk_ref` | `hl2sdk-cs2` commit/branch to pin (native engine ABI) | `cs2` |
+| `mms_ref` | `metamod-source` commit/branch to pin (plugin API) | `master` |
 | `old_manifest` / `new_manifest` | depot manifest IDs (manifest mode) | — |
 | `publish_release` | create a GitHub Release | `true` |
 | `with_runtime` | bundle the .NET runtime into the zip (off = server must already have the runtime installed) | `true` |
 
 Inside `tools/run_pipeline.sh`: `DOTNET_TAG` and `ASPNET_RUNTIME` — match these to
 the CSS version you build (upstream `main` currently uses .NET 10; older tags use
-.NET 8).
+.NET 8). `SKIP_BUILD=1` stops after the RE recovery, so you can run the fetch +
+recovery by hand on a machine without Docker and still get `gamedata.json` and
+`recovery-report.json`.
 
 ---
 
