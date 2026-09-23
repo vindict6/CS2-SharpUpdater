@@ -55,11 +55,25 @@ git clone --depth 1 --branch "$CSS_REF" "$CSS_REPO" "$CSS" 2>/dev/null \
   git submodule update --init --recursive --depth 1 )
 
 echo "==> [2/7] bump hl2sdk-cs2 -> $SDK_REF"
+SDK_PIN="$(git -C "$CSS" rev-parse "HEAD:libraries/hl2sdk-cs2")"
 ( cd "$CSS/libraries/hl2sdk-cs2"
   git fetch --depth 1 origin "$SDK_REF"
   git checkout -q FETCH_HEAD
   git submodule update --init --recursive --depth 1
-  echo "    hl2sdk-cs2 now at $(git rev-parse --short HEAD)" )
+  echo "    hl2sdk-cs2 now at $(git rev-parse --short HEAD) (CSS pins ${SDK_PIN:0:8})" )
+# The SDK head occasionally removes or moves a source file that the CSS ref
+# still compiles directly (e.g. tier1/generichash.cpp, 2026-09-21). That fails
+# at CMake configure, so fall back to the commit CSS pins rather than die.
+SDK_MISSING="$(grep -oE 'libraries/hl2sdk-cs2/[^ )]+\.(cpp|c)' "$CSS/CMakeLists.txt" | sort -u \
+  | while read -r f; do [ -f "$CSS/$f" ] || echo "$f"; done)"
+if [ -n "$SDK_MISSING" ]; then
+  echo "    WARNING: hl2sdk-cs2 '$SDK_REF' lacks sources this CSS ref compiles:"
+  echo "$SDK_MISSING" | sed 's/^/      /'
+  echo "    reverting hl2sdk-cs2 to the CSS-pinned ${SDK_PIN:0:8}"
+  ( cd "$CSS/libraries/hl2sdk-cs2"
+    git checkout -q "$SDK_PIN"
+    git submodule update --init --recursive --depth 1 )
+fi
 
 echo "==> [3/7] bump metamod-source -> $MMS_REF"
 ( cd "$CSS/libraries/metamod-source"

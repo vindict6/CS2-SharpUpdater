@@ -182,10 +182,12 @@ jobs:
           echo "VERSION=$(cat "$OUT/VERSION")" >> "$GITHUB_OUTPUT"
 
       - name: Upload build artifact
-        if: steps.build.outcome == 'success'
+        # also on build failure: the recovered gamedata + report are still useful
+        if: always() && steps.fetch.outputs.UPDATE == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: counterstrikesharp-${{ steps.build.outputs.VERSION }}
+          name: counterstrikesharp-${{ steps.build.outputs.VERSION || format('recovery-{0}', steps.fetch.outputs.NEW_BUILDID) }}
+          if-no-files-found: ignore
           path: |
             out/*.zip
             out/gamedata.json

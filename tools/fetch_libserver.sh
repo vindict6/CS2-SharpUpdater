@@ -57,7 +57,11 @@ echo "$FILE" > "$WORK/filelist.txt"
 
 # download one specific manifest into $1, copy the .so to $2
 dl_manifest() {
-  local manifest="$1" dest="$2" dir
+  local manifest="$1" dest="$2" dir cached="$STATE/cache/libserver.${manifest}.so"
+  if [ -s "$cached" ]; then
+    echo "[fetch] manifest $manifest: using cached copy"
+    cp "$cached" "$dest"; return
+  fi
   dir="$WORK/dl_${manifest}"
   rm -rf "$dir"; mkdir -p "$dir"
   echo "[fetch] downloading depot $DEPOT manifest $manifest ..."
@@ -66,6 +70,7 @@ dl_manifest() {
     -filelist "$WORK/filelist.txt" -dir "$dir" \
     || { echo "ERROR: DepotDownloader failed for manifest $manifest"; exit 1; }
   [ -f "$dir/$FILE" ] || { echo "ERROR: $FILE missing after download (manifest $manifest)"; exit 1; }
+  mkdir -p "$STATE/cache"; cp "$dir/$FILE" "$cached"
   cp "$dir/$FILE" "$dest"
 }
 
