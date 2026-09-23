@@ -57,7 +57,8 @@ echo "$FILE" > "$WORK/filelist.txt"
 
 # download one specific manifest into $1, copy the .so to $2
 dl_manifest() {
-  local manifest="$1" dest="$2" dir cached="$STATE/cache/libserver.${manifest}.so"
+  local manifest="$1" dest="$2" dir cached
+  cached="$STATE/cache/libserver.${manifest}.so"
   if [ -s "$cached" ]; then
     echo "[fetch] manifest $manifest: using cached copy"
     cp "$cached" "$dest"; return
