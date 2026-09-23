@@ -89,12 +89,66 @@ jobs:
       - name: Checkout updater
         uses: actions/checkout@v4
 
-      - name: Tooling
+      - name: Tooling (install missing dependencies)
         run: |
-          python3 -m pip install --upgrade --break-system-packages pyelftools capstone
-          command -v unzip >/dev/null || (sudo apt-get update && sudo apt-get install -y unzip binutils zip)
-          command -v zip >/dev/null || sudo apt-get install -y zip
+          set -e
+          SUDO=""
+          if [ "$(id -u)" = 0 ]; then SUDO="env"; elif sudo -n true 2>/dev/null; then SUDO="sudo -n"; fi
+          [ -n "$SUDO" ] && echo "root/sudo available" || echo "::warning::no passwordless sudo; will only do non-root installs"
+
+          # --- apt packages ---
+          need=()
+          for pair in git:git readelf:binutils zip:zip unzip:unzip curl:curl python3:python3; do
+            command -v "${pair%%:*}" >/dev/null || need+=("${pair##*:}")
+          done
+          python3 -m pip --version >/dev/null 2>&1 || need+=(python3-pip)
+          command -v docker >/dev/null || need+=(docker.io)
+          if [ ${#need[@]} -gt 0 ]; then
+            echo "missing: ${need[*]}"
+            if [ -n "$SUDO" ]; then
+              $SUDO apt-get update -qq
+              $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${need[@]}"
+            fi
+          fi
+
+          # --- pip (non-root bootstrap if apt could not provide it) ---
+          if ! python3 -m pip --version >/dev/null 2>&1; then
+            python3 -m ensurepip --user >/dev/null 2>&1 \
+              || curl -fsSL https://bootstrap.pypa.io/get-pip.py | python3 - --user --break-system-packages \
+              || curl -fsSL https://bootstrap.pypa.io/get-pip.py | python3 - --user
+          fi
+          python3 -m pip --version
+
+          # --- python deps (pyelftools + capstone for the RE engine) ---
+          python3 -m pip install --user --upgrade --break-system-packages pyelftools capstone 2>/dev/null \
+            || python3 -m pip install --user --upgrade pyelftools capstone
+          python3 -c "import elftools, capstone; print('pyelftools', elftools.__version__, 'capstone', capstone.__version__)"
+
+          # --- required CLI tools ---
+          for t in git readelf zip unzip curl docker; do
+            command -v "$t" >/dev/null || { echo "::error::'$t' is missing and could not be installed (no passwordless sudo). Install it on the runner: sudo apt-get install -y git binutils zip unzip curl docker.io"; exit 1; }
+          done
           docker --version
+
+          # --- docker daemon access for the runner user ---
+          if ! docker info >/dev/null 2>&1; then
+            if [ -n "$SUDO" ]; then
+              $SUDO systemctl enable --now docker 2>/dev/null || $SUDO service docker start 2>/dev/null || true
+              $SUDO usermod -aG docker "$(id -un)" || true
+            fi
+            if docker info >/dev/null 2>&1; then
+              echo "docker daemon: OK"
+            elif sg docker -c 'docker info' >/dev/null 2>&1; then
+              # membership added just now; this shell predates it, so run docker via sg
+              echo "docker daemon: OK via 'sg docker' (restart the runner service to make it permanent)"
+              echo "DOCKER_SG=1" >> "$GITHUB_ENV"
+            else
+              echo "::error::runner user $(id -un) cannot reach the Docker daemon. On the runner: sudo systemctl enable --now docker && sudo usermod -aG docker $(id -un) && restart the runner service (see README > Troubleshooting)."
+              exit 1
+            fi
+          else
+            echo "docker daemon: OK"
+          fi
 
       - name: Fetch libserver.so (old + new)
         id: fetch
@@ -117,7 +171,11 @@ jobs:
           chmod +x tools/run_pipeline.sh
           export OLD_SO="$WORK/libserver.old.so"
           export NEW_SO="$WORK/libserver.new.so"
-          tools/run_pipeline.sh
+          if [ "${DOCKER_SG:-0}" = "1" ]; then
+            sg docker -c tools/run_pipeline.sh
+          else
+            tools/run_pipeline.sh
+          fi
           echo "VERSION=$(cat "$OUT/VERSION")" >> "$GITHUB_OUTPUT"
 
       - name: Upload build artifact
