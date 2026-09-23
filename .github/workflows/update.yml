@@ -79,7 +79,7 @@ jobs:
           if [ -e "$TARGET" ]; then
             echo "removing $TARGET"
             docker run --rm -v "$WORK_PARENT:/w" alpine:3 sh -c "rm -rf \"/w/$WORK_NAME\"" \
-              || sudo rm -rf "$TARGET" \
+              || sudo -n rm -rf "$TARGET" \
               || rm -rf "$TARGET" \
               || true
           fi
