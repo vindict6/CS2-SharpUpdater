@@ -118,14 +118,32 @@ if [ "${SKIP_BUILD:-0}" = "1" ]; then
   exit 0
 fi
 
+native_build() {
+  docker run --rm -v "$CSS:/src" -w /src "$SNIPER" bash -euc '
+    git config --global --add safe.directory /src || true
+    git config --global --add safe.directory "*" || true
+    rm -rf build && mkdir -p build && cd build
+    cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
+    cmake --build . --config Release -- -j"$(nproc)"
+  '
+}
+
 echo "==> [5/7] native build (sniper SDK container)"
-docker run --rm -v "$CSS:/src" -w /src "$SNIPER" bash -euc '
-  git config --global --add safe.directory /src || true
-  git config --global --add safe.directory "*" || true
-  mkdir -p build && cd build
-  cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
-  cmake --build . --config Release -- -j"$(nproc)"
-'
+if ! native_build; then
+  SDK_NOW="$(git -C "$CSS/libraries/hl2sdk-cs2" rev-parse HEAD)"
+  if [ "$SDK_NOW" = "$SDK_PIN" ]; then
+    echo "ERROR: native build failed against the hl2sdk-cs2 commit CSS itself pins; upstream fix needed"
+    exit 1
+  fi
+  # The SDK head can also change APIs the CSS ref still relies on (e.g.
+  # CVariantBase members going private, 2026-09-30); the configure-time file
+  # check above cannot see that, so retry once with the commit CSS pins.
+  echo "    WARNING: native build failed against hl2sdk-cs2 ${SDK_NOW:0:8}; retrying with the CSS-pinned ${SDK_PIN:0:8}"
+  ( cd "$CSS/libraries/hl2sdk-cs2"
+    git checkout -q "$SDK_PIN"
+    git submodule update --init --recursive --depth 1 )
+  native_build
+fi
 # CMake copies configs/ (incl. our recovered gamedata) into build/addons.
 rm -rf "$WORK/dist"; mkdir -p "$WORK/dist"
 cp -r "$CSS/build/addons" "$WORK/dist/addons"
