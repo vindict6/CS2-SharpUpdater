@@ -76,6 +76,7 @@ if [ -n "$SDK_MISSING" ]; then
 fi
 
 echo "==> [3/7] bump metamod-source -> $MMS_REF"
+MMS_PIN="$(git -C "$CSS" rev-parse "HEAD:libraries/metamod-source")"
 ( cd "$CSS/libraries/metamod-source"
   git fetch --depth 1 origin "$MMS_REF"
   git checkout -q FETCH_HEAD
@@ -128,21 +129,39 @@ native_build() {
   '
 }
 
+pin_submodule() {   # $1 = path under $CSS, $2 = commit
+  ( cd "$CSS/$1"
+    git checkout -q "$2"
+    git submodule update --init --recursive --depth 1 )
+}
+
+# Bumped submodule heads can change APIs the CSS ref still relies on (e.g.
+# hl2sdk's CVariantBase members going private, 2026-09-30; metamod-source's
+# s2sdk include rework, 2026-10-13), which the configure-time file check above
+# cannot see. Fall back one submodule at a time to the commits CSS pins: the
+# pinned pair is exactly what upstream's own CI builds.
 echo "==> [5/7] native build (sniper SDK container)"
 if ! native_build; then
+  BUILT=0
   SDK_NOW="$(git -C "$CSS/libraries/hl2sdk-cs2" rev-parse HEAD)"
-  if [ "$SDK_NOW" = "$SDK_PIN" ]; then
-    echo "ERROR: native build failed against the hl2sdk-cs2 commit CSS itself pins; upstream fix needed"
-    exit 1
+  if [ "$SDK_NOW" != "$SDK_PIN" ]; then
+    echo "    WARNING: native build failed against hl2sdk-cs2 ${SDK_NOW:0:8}; retrying with the CSS-pinned ${SDK_PIN:0:8}"
+    pin_submodule libraries/hl2sdk-cs2 "$SDK_PIN"
+    native_build && BUILT=1
   fi
-  # The SDK head can also change APIs the CSS ref still relies on (e.g.
-  # CVariantBase members going private, 2026-09-30); the configure-time file
-  # check above cannot see that, so retry once with the commit CSS pins.
-  echo "    WARNING: native build failed against hl2sdk-cs2 ${SDK_NOW:0:8}; retrying with the CSS-pinned ${SDK_PIN:0:8}"
-  ( cd "$CSS/libraries/hl2sdk-cs2"
-    git checkout -q "$SDK_PIN"
-    git submodule update --init --recursive --depth 1 )
-  native_build
+  if [ "$BUILT" = 0 ]; then
+    MMS_NOW="$(git -C "$CSS/libraries/metamod-source" rev-parse HEAD)"
+    if [ "$MMS_NOW" = "$MMS_PIN" ]; then
+      echo "ERROR: native build failed against the hl2sdk-cs2 + metamod-source commits CSS itself pins; upstream fix needed"
+      exit 1
+    fi
+    echo "    WARNING: native build still failing; retrying with the CSS-pinned metamod-source ${MMS_PIN:0:8}"
+    pin_submodule libraries/metamod-source "$MMS_PIN"
+    PLAPI="$(grep -oE 'METAMOD_PLAPI_VERSION[[:space:]]+[0-9]+' \
+               "$CSS/libraries/metamod-source/core/ISmmPluginExt.h" | grep -oE '[0-9]+$' || true)"
+    echo "    Metamod plugin API version now: ${PLAPI:-unknown}"
+    native_build
+  fi
 fi
 # CMake copies configs/ (incl. our recovered gamedata) into build/addons.
 rm -rf "$WORK/dist"; mkdir -p "$WORK/dist"
