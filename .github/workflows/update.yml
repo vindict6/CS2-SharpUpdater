@@ -25,6 +25,11 @@ on:
       css_ref:
         description: "CounterStrikeSharp ref/tag to build (e.g. v1.0.305 or main)"
         default: "main"
+      sdk_repo:
+        description: "hl2sdk-cs2 source: vindict6 (vindict6/hl2sdk-cs2, ABI fixes ahead of upstream) or official (alliedmodders/hl2sdk)"
+        type: choice
+        options: [vindict6, official]
+        default: vindict6
       sdk_ref:
         description: "hl2sdk-cs2 commit/branch to pin (native engine ABI)"
         default: "cs2"
@@ -62,6 +67,8 @@ jobs:
       STATE: ${{ github.workspace }}/../csu-state    # persists across runs on the box
       MODE: ${{ inputs.mode || 'baseline' }}
       CSS_REF: ${{ inputs.css_ref || 'main' }}
+      # scheduled runs have no inputs, so they take the fork too
+      SDK_REPO: ${{ inputs.sdk_repo == 'official' && 'https://github.com/alliedmodders/hl2sdk.git' || 'https://github.com/vindict6/hl2sdk-cs2.git' }}
       SDK_REF: ${{ inputs.sdk_ref || 'cs2' }}
       MMS_REF: ${{ inputs.mms_ref || 'master' }}
     steps:
@@ -180,6 +187,7 @@ jobs:
             tools/run_pipeline.sh
           fi
           echo "VERSION=$(cat "$OUT/VERSION")" >> "$GITHUB_OUTPUT"
+          { echo "SUBMODULES<<EOF"; cat "$OUT/SUBMODULES"; echo "EOF"; } >> "$GITHUB_OUTPUT"
 
       - name: Upload build artifact
         # also on build failure: the recovered gamedata + report are still useful
@@ -202,6 +210,11 @@ jobs:
           body: |
             Automated CounterStrikeSharp build with RE-recovered gamedata for CS2
             build `${{ steps.fetch.outputs.NEW_BUILDID }}` (was `${{ steps.fetch.outputs.OLD_BUILDID }}`).
+
+            Built against:
+            ```
+            ${{ steps.build.outputs.SUBMODULES }}
+            ```
 
             The `with-runtime` zip drops into `<server>/game/csgo/`. See the attached
             `recovery-report.json` for which signatures/offsets were repaired and

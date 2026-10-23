@@ -18,6 +18,9 @@
 #   OLD_SO, NEW_SO       paths to the two binaries
 #   CSS_REF              git ref/tag/branch of roflmuffin/CounterStrikeSharp (default: main)
 #   CSS_REPO             CSS git url (default: official)
+#   SDK_REPO             hl2sdk-cs2 git url to fetch SDK_REF from (default: official
+#                        alliedmodders/hl2sdk; vindict6/hl2sdk-cs2 carries ABI fixes
+#                        ahead of upstream)
 #   SDK_REF              hl2sdk-cs2 commit/branch to pin (default: cs2 head)
 #   MMS_REF              metamod-source commit/branch to pin (default: master head)
 #   SKIP_BUILD           1 = stop after the RE recovery (no Docker needed); the
@@ -36,8 +39,13 @@ WORK="${WORK:?set WORK}"
 OUT="${OUT:?set OUT}"
 CSS_REPO="${CSS_REPO:-https://github.com/roflmuffin/CounterStrikeSharp.git}"
 CSS_REF="${CSS_REF:-main}"
+SDK_OFFICIAL="https://github.com/alliedmodders/hl2sdk.git"
+SDK_REPO="${SDK_REPO:-$SDK_OFFICIAL}"
 SDK_REF="${SDK_REF:-cs2}"
 MMS_REF="${MMS_REF:-master}"
+# A non-official SDK repo is there to carry an ABI fix, so never fall back to
+# the CSS-pinned SDK from it: that build would load fine and crash at runtime.
+if [ "${SDK_REPO%.git}" = "${SDK_OFFICIAL%.git}" ]; then SDK_CUSTOM=0; else SDK_CUSTOM=1; fi
 DOTNET_TAG="${DOTNET_TAG:-10.0}"
 ASPNET_RUNTIME="${ASPNET_RUNTIME:-10.0.3}"
 SNIPER="registry.gitlab.steamos.cloud/steamrt/sniper/sdk:latest"
@@ -54,10 +62,10 @@ git clone --depth 1 --branch "$CSS_REF" "$CSS_REPO" "$CSS" 2>/dev/null \
 ( cd "$CSS" && git checkout -q "$CSS_REF" 2>/dev/null || true
   git submodule update --init --recursive --depth 1 )
 
-echo "==> [2/7] bump hl2sdk-cs2 -> $SDK_REF"
+echo "==> [2/7] bump hl2sdk-cs2 -> $SDK_REPO @ $SDK_REF"
 SDK_PIN="$(git -C "$CSS" rev-parse "HEAD:libraries/hl2sdk-cs2")"
 ( cd "$CSS/libraries/hl2sdk-cs2"
-  git fetch --depth 1 origin "$SDK_REF"
+  git fetch --depth 1 "$SDK_REPO" "$SDK_REF"
   git checkout -q FETCH_HEAD
   git submodule update --init --recursive --depth 1
   echo "    hl2sdk-cs2 now at $(git rev-parse --short HEAD) (CSS pins ${SDK_PIN:0:8})" )
@@ -69,6 +77,11 @@ SDK_MISSING="$(grep -oE 'libraries/hl2sdk-cs2/[^ )]+\.(cpp|c)' "$CSS/CMakeLists.
 if [ -n "$SDK_MISSING" ]; then
   echo "    WARNING: hl2sdk-cs2 '$SDK_REF' lacks sources this CSS ref compiles:"
   echo "$SDK_MISSING" | sed 's/^/      /'
+  if [ "$SDK_CUSTOM" = 1 ]; then
+    echo "ERROR: not reverting a custom SDK_REPO to the CSS pin (it would drop the ABI fix);"
+    echo "       add the missing sources to $SDK_REPO or set SDK_REPO=$SDK_OFFICIAL"
+    exit 1
+  fi
   echo "    reverting hl2sdk-cs2 to the CSS-pinned ${SDK_PIN:0:8}"
   ( cd "$CSS/libraries/hl2sdk-cs2"
     git checkout -q "$SDK_PIN"
@@ -139,30 +152,43 @@ pin_submodule() {   # $1 = path under $CSS, $2 = commit
 # hl2sdk's CVariantBase members going private, 2026-09-30; metamod-source's
 # s2sdk include rework, 2026-10-13), which the configure-time file check above
 # cannot see. Fall back one submodule at a time to the commits CSS pins: the
-# pinned pair is exactly what upstream's own CI builds.
+# pinned pair is exactly what upstream's own CI builds. Metamod goes first: the
+# SDK carries the engine vtable layout, so reverting it can turn a compile error
+# into a build that segfaults on the server (CS2 1.41.9.2, 2026-10-22).
 echo "==> [5/7] native build (sniper SDK container)"
 if ! native_build; then
   BUILT=0
-  SDK_NOW="$(git -C "$CSS/libraries/hl2sdk-cs2" rev-parse HEAD)"
-  if [ "$SDK_NOW" != "$SDK_PIN" ]; then
-    echo "    WARNING: native build failed against hl2sdk-cs2 ${SDK_NOW:0:8}; retrying with the CSS-pinned ${SDK_PIN:0:8}"
-    pin_submodule libraries/hl2sdk-cs2 "$SDK_PIN"
-    native_build && BUILT=1
-  fi
-  if [ "$BUILT" = 0 ]; then
-    MMS_NOW="$(git -C "$CSS/libraries/metamod-source" rev-parse HEAD)"
-    if [ "$MMS_NOW" = "$MMS_PIN" ]; then
-      echo "ERROR: native build failed against the hl2sdk-cs2 + metamod-source commits CSS itself pins; upstream fix needed"
-      exit 1
-    fi
-    echo "    WARNING: native build still failing; retrying with the CSS-pinned metamod-source ${MMS_PIN:0:8}"
+  MMS_NOW="$(git -C "$CSS/libraries/metamod-source" rev-parse HEAD)"
+  if [ "$MMS_NOW" != "$MMS_PIN" ]; then
+    echo "    WARNING: native build failed against metamod-source ${MMS_NOW:0:8}; retrying with the CSS-pinned ${MMS_PIN:0:8}"
     pin_submodule libraries/metamod-source "$MMS_PIN"
     PLAPI="$(grep -oE 'METAMOD_PLAPI_VERSION[[:space:]]+[0-9]+' \
                "$CSS/libraries/metamod-source/core/ISmmPluginExt.h" | grep -oE '[0-9]+$' || true)"
     echo "    Metamod plugin API version now: ${PLAPI:-unknown}"
+    native_build && BUILT=1
+  fi
+  if [ "$BUILT" = 0 ]; then
+    SDK_NOW="$(git -C "$CSS/libraries/hl2sdk-cs2" rev-parse HEAD)"
+    if [ "$SDK_CUSTOM" = 1 ]; then
+      echo "ERROR: native build failed against $SDK_REPO ${SDK_NOW:0:8}; not falling back to the"
+      echo "       CSS-pinned SDK (it would drop the ABI fix). Fix the fork or set SDK_REPO=$SDK_OFFICIAL"
+      exit 1
+    fi
+    if [ "$SDK_NOW" = "$SDK_PIN" ]; then
+      echo "ERROR: native build failed against the hl2sdk-cs2 + metamod-source commits CSS itself pins; upstream fix needed"
+      exit 1
+    fi
+    echo "    WARNING: native build still failing; retrying with the CSS-pinned hl2sdk-cs2 ${SDK_PIN:0:8}"
+    echo "             (this SDK may not match the current engine vtables)"
+    pin_submodule libraries/hl2sdk-cs2 "$SDK_PIN"
     native_build
   fi
 fi
+SDK_USED="$(git -C "$CSS/libraries/hl2sdk-cs2" rev-parse HEAD)"
+MMS_USED="$(git -C "$CSS/libraries/metamod-source" rev-parse HEAD)"
+[ "$SDK_USED" = "$SDK_PIN" ] && SDK_FROM="$SDK_OFFICIAL" || SDK_FROM="$SDK_REPO"
+echo "    built against hl2sdk-cs2 ${SDK_FROM%.git}@${SDK_USED:0:8}, metamod-source ${MMS_USED:0:8}"
+printf 'hl2sdk-cs2 %s@%s\nmetamod-source %s\n' "${SDK_FROM%.git}" "$SDK_USED" "$MMS_USED" > "$OUT/SUBMODULES"
 # CMake copies configs/ (incl. our recovered gamedata) into build/addons.
 rm -rf "$WORK/dist"; mkdir -p "$WORK/dist"
 cp -r "$CSS/build/addons" "$WORK/dist/addons"

@@ -27,8 +27,10 @@ On a schedule (or on demand) the `update` workflow:
 1. **Fetches** the current `libserver.so` from the CS2 dedicated-server depot, and
    uses the previous run's binary as the "before" copy.
 2. If the game changed, **clones official CounterStrikeSharp** at a ref you choose.
-3. **Bumps `hl2sdk-cs2`** to the current `cs2` branch head (fixes the native ABI)
-   and **`metamod-source`** to the current `master` head (tracks the Metamod:Source
+3. **Bumps `hl2sdk-cs2`** to the current `cs2` branch head (fixes the native ABI),
+   from [vindict6/hl2sdk-cs2](https://github.com/vindict6/hl2sdk-cs2) by default
+   (official `alliedmodders/hl2sdk` plus engine vtable fixes that upstream hasn't
+   merged yet; the official `cs2` branch has been frozen since 2026-10-07), and **`metamod-source`** to the current `master` head (tracks the Metamod:Source
    plugin API — dev builds like 2.0.0-git1469 are cut straight from `master`).
 4. **Reverse-engineers the gamedata**: for every broken signature it re-locates the
    function in the new binary using three mutually-confirming signals — the strings
@@ -211,13 +213,15 @@ Set these as workflow inputs (manual runs) or edit `update.yml`:
 |---|---|---|
 | `mode` | `baseline` (auto-diff) or `manifest` (pinned test) | `baseline` |
 | `css_ref` | CounterStrikeSharp tag/branch to build | `main` |
+| `sdk_repo` | where `sdk_ref` comes from: `vindict6` ([vindict6/hl2sdk-cs2](https://github.com/vindict6/hl2sdk-cs2)) or `official` (`alliedmodders/hl2sdk`). With `vindict6` the build fails instead of falling back to the CSS-pinned SDK, since that fallback would drop the ABI fix | `vindict6` |
 | `sdk_ref` | `hl2sdk-cs2` commit/branch to pin (native engine ABI) | `cs2` |
 | `mms_ref` | `metamod-source` commit/branch to pin (plugin API) | `master` |
 | `old_manifest` / `new_manifest` | depot manifest IDs (manifest mode) | — |
 | `publish_release` | create a GitHub Release | `true` |
 | `with_runtime` | bundle the .NET runtime into the zip (off = server must already have the runtime installed) | `true` |
 
-Inside `tools/run_pipeline.sh`: `DOTNET_TAG` and `ASPNET_RUNTIME` — match these to
+For local runs of `tools/run_pipeline.sh` the same choice is the `SDK_REPO` env var
+(a git url; defaults to the official repo there). Inside `tools/run_pipeline.sh`: `DOTNET_TAG` and `ASPNET_RUNTIME` — match these to
 the CSS version you build (upstream `main` currently uses .NET 10; older tags use
 .NET 8). `SKIP_BUILD=1` stops after the RE recovery, so you can run the fetch +
 recovery by hand on a machine without Docker and still get `gamedata.json` and
