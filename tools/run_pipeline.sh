@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# run_pipeline.sh - the heart of CS2-SharpUpdater.
+# run_pipeline.sh - recover gamedata and build CounterStrikeSharp for a new CS2 build.
 #
-# Given OLD/NEW libserver.so (already fetched), this:
+# Given OLD/NEW libserver.so (already fetched), this script:
 #   1. clones the official CounterStrikeSharp at a chosen ref (submodules)
 #   2. bumps libraries/hl2sdk-cs2 to the current cs2 branch head (native ABI fix)
 #   3. bumps libraries/metamod-source to the current master head (plugin API;
@@ -11,8 +11,8 @@
 #   6. assembles a ready-to-deploy addons/ bundle (native + api + gamedata + runtime)
 #      and zips it
 #
-# This is the "fixed" build/publish: no GitVersion dependency, TFM path globbed,
-# fork-friendly (no repo-name gate, no NuGet/Discord), Linux-focused.
+# The build has no GitVersion dependency, globs the target framework path, works
+# from any fork (no repo-name check, no NuGet/Discord publishing) and targets Linux.
 #
 # Inputs (env):
 #   OLD_SO, NEW_SO       paths to the two binaries
@@ -69,9 +69,9 @@ SDK_PIN="$(git -C "$CSS" rev-parse "HEAD:libraries/hl2sdk-cs2")"
   git checkout -q FETCH_HEAD
   git submodule update --init --recursive --depth 1
   echo "    hl2sdk-cs2 now at $(git rev-parse --short HEAD) (CSS pins ${SDK_PIN:0:8})" )
-# The SDK head occasionally removes or moves a source file that the CSS ref
-# still compiles directly (e.g. tier1/generichash.cpp, 2026-09-21). That fails
-# at CMake configure, so fall back to the commit CSS pins rather than die.
+# The SDK head can remove or move a source file that the CSS ref still compiles
+# directly (e.g. tier1/generichash.cpp). That fails at CMake configure, so fall
+# back to the commit CSS pins instead of failing.
 SDK_MISSING="$(grep -oE 'libraries/hl2sdk-cs2/[^ )]+\.(cpp|c)' "$CSS/CMakeLists.txt" | sort -u \
   | while read -r f; do [ -f "$CSS/$f" ] || echo "$f"; done)"
 if [ -n "$SDK_MISSING" ]; then
@@ -98,11 +98,11 @@ MMS_PIN="$(git -C "$CSS" rev-parse "HEAD:libraries/metamod-source")"
 PLAPI="$(grep -oE 'METAMOD_PLAPI_VERSION[[:space:]]+[0-9]+' \
            "$CSS/libraries/metamod-source/core/ISmmPluginExt.h" | grep -oE '[0-9]+$' || true)"
 echo "    Metamod plugin API version: ${PLAPI:-unknown}"
-# Plugin API 18 (Metamod:Source master from 2026-09-08, dev build ~1454+) dropped
-# SourceHook for KHook and raised the minimum load version: a CSS tree that still
+# Plugin API 18 (Metamod:Source dev builds ~1454 and later) uses KHook instead of
+# SourceHook and has a higher minimum load version: a CSS tree that still
 # compiles SourceHook cannot build against it, and a plugin built against API 17
-# is refused by the new Metamod at load time. Catch that here instead of deep in
-# the native build.
+# is refused by that Metamod at load time. Catch the mismatch here rather than
+# deep in the native build.
 if [ "${PLAPI:-0}" -ge 18 ] && grep -q 'sourcehook/sourcehook.cpp' "$CSS/CMakeLists.txt"; then
   echo "ERROR: CounterStrikeSharp ref '$CSS_REF' still uses SourceHook, but metamod-source"
   echo "       '$MMS_REF' is plugin API $PLAPI (KHook only). Use a CSS ref that includes the"
@@ -118,7 +118,7 @@ python3 "$HERE/cs2_update_gamedata.py" \
   --out "$CSS/$GAMEDATA_REL.new" \
   --report "$OUT/recovery-report.json" || RC=$?
 RC="${RC:-0}"
-# driver exits 2 when some entries need review; that is not fatal for the build.
+# The recovery script exits 2 when some entries need review; that is not fatal for the build.
 if [ ! -s "$CSS/$GAMEDATA_REL.new" ]; then
   echo "ERROR: recovery produced no gamedata"; exit 1
 fi
@@ -149,12 +149,12 @@ pin_submodule() {   # $1 = path under $CSS, $2 = commit
 }
 
 # Bumped submodule heads can change APIs the CSS ref still relies on (e.g.
-# hl2sdk's CVariantBase members going private, 2026-09-30; metamod-source's
-# s2sdk include rework, 2026-10-13), which the configure-time file check above
-# cannot see. Fall back one submodule at a time to the commits CSS pins: the
-# pinned pair is exactly what upstream's own CI builds. Metamod goes first: the
-# SDK carries the engine vtable layout, so reverting it can turn a compile error
-# into a build that segfaults on the server (CS2 1.41.9.2, 2026-10-22).
+# hl2sdk's CVariantBase members becoming private, or metamod-source's s2sdk
+# include layout), which the configure-time file check above cannot see. Fall
+# back one submodule at a time to the commits CSS pins: the pinned pair is
+# exactly what upstream's own CI builds. Metamod is reverted first because the
+# SDK carries the engine vtable layout, and reverting the SDK can turn a compile
+# error into a build that segfaults on the server.
 echo "==> [5/7] native build (sniper SDK container)"
 if ! native_build; then
   BUILT=0
@@ -204,7 +204,7 @@ docker run --rm -v "$CSS:/src" -w /src "mcr.microsoft.com/dotnet/sdk:${DOTNET_TA
   dotnet publish -c Release --no-restore managed/CounterStrikeSharp.API
 '
 mkdir -p "$WORK/dist/addons/counterstrikesharp/api"
-# glob the TFM so this does not break when net10.0 -> net11.0 etc. (upstream bug)
+# Glob the target framework folder so the copy keeps working when the TFM changes (net10.0 -> net11.0).
 if ls "$CSS"/managed/CounterStrikeSharp.API/bin/Release/*/publish >/dev/null 2>&1; then
   cp -r "$CSS"/managed/CounterStrikeSharp.API/bin/Release/*/publish/* "$WORK/dist/addons/counterstrikesharp/api/"
 else

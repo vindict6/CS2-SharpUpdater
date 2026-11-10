@@ -1,9 +1,9 @@
 name: setup-check
 
-# Run this ONCE after forking (Actions tab -> setup-check -> Run workflow).
-# It verifies your fork is configured correctly so the real pipeline won't fail
-# halfway: runner online, Docker present, Python deps installable, Steam login
-# works, and the CS2 depot is reachable. It downloads nothing large and changes
+# Run once after forking (Actions tab -> setup-check -> Run workflow).
+# Verifies the fork is configured so the update pipeline won't fail partway
+# through: runner online, Docker present, Python deps installable, Steam login
+# works, and the CS2 depot is reachable. Downloads nothing large and changes
 # nothing.
 
 on:

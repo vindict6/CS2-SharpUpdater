@@ -3,13 +3,13 @@ using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Utils;
 
-// GamedataSmokeTest - validates the RECOVERED gamedata entries at RUNTIME.
+// GamedataSmokeTest - validates recovered gamedata entries at runtime.
 //
-// Static analysis proved each recovered signature matches exactly one address
-// and each offset points at a matched vtable slot. The only thing static checks
-// cannot confirm is that the resolved function is *semantically* correct and
-// that calling through it doesn't crash. This plugin does that: it resolves and
-// exercises the recovered entries on a live server.
+// Static analysis confirms each recovered signature matches exactly one address
+// and each offset points at a matched vtable slot. It cannot confirm that the
+// resolved function is semantically correct or that calling through it doesn't
+// crash, so this plugin resolves and exercises the recovered entries on a live
+// server.
 //
 // Build:  dotnet build  (reference your freshly built CounterStrikeSharp.API.dll)
 // Deploy: <server>/game/csgo/addons/counterstrikesharp/plugins/GamedataSmokeTest/
@@ -19,7 +19,7 @@ using CounterStrikeSharp.API.Modules.Utils;
 //
 // If CounterStrikeSharp itself fails to resolve a sig at load, it logs
 //   "Failed to find signature/offset for <name>"
-// so ALSO check the server log after startup - that is the first-line test.
+// so check the server log after startup as well; that is the first-line test.
 
 namespace GamedataSmokeTest;
 
@@ -30,7 +30,7 @@ public class GamedataSmokeTest : BasePlugin
     public override string ModuleAuthor => "cs2-recover";
     public override string ModuleDescription => "Exercises recovered gamedata entries at runtime.";
 
-    // The entries this recovery run touched. Adjust to match your report.json.
+    // Entries touched by the recovery run. Adjust to match report.json.
     private static readonly string[] RecoveredSignatures =
     {
         "ClientPrint", "Host_Say", "CCSGameRules_TerminateRound",
@@ -58,8 +58,8 @@ public class GamedataSmokeTest : BasePlugin
     {
         int okSig = 0, okOff = 0;
 
-        // 1) Signature resolution: ask the gamedata system for each address.
-        //    NativeAPI.GetSignatureAddress returns 0 / throws if unresolved.
+        // Signature resolution: ask the gamedata system for each address.
+        // NativeAPI.GetValveSignature returns zero or throws if unresolved.
         foreach (var name in RecoveredSignatures)
         {
             try
@@ -75,7 +75,7 @@ public class GamedataSmokeTest : BasePlugin
             }
         }
 
-        // 2) Offset resolution.
+        // Offset resolution.
         foreach (var name in RecoveredOffsets)
         {
             try
@@ -91,9 +91,9 @@ public class GamedataSmokeTest : BasePlugin
             }
         }
 
-        // 3) EXERCISE ClientPrint end-to-end: actually invoke the recovered
-        //    function. If the sig points at the wrong code this typically prints
-        //    garbage or crashes - so a clean chat print is a strong positive.
+        // Exercise ClientPrint end-to-end by invoking the recovered function. If
+        // the sig points at the wrong code this typically prints garbage or
+        // crashes, so a clean chat print is a strong positive.
         try
         {
             foreach (var p in Utilities.GetPlayers())

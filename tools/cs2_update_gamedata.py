@@ -17,7 +17,7 @@ gamedata.json, this:
 
 Everything is verified statically: every emitted sig is confirmed to match
 exactly one address in the new binary, and every offset change is backed by a
-high CFG-cosine function match. Anything uncertain is FLAGGED, never guessed.
+high CFG-cosine function match. Anything uncertain is flagged, never guessed.
 
 Pure Python 3 + pyelftools + capstone. No Ghidra.
 
@@ -39,9 +39,7 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_64
 from capstone.x86 import X86_OP_MEM, X86_OP_IMM, X86_OP_REG, X86_REG_RIP, X86_REG_RSP
 
 
-# --------------------------------------------------------------------------- #
-#  low-level binary access
-# --------------------------------------------------------------------------- #
+# Low-level binary access
 class Binary:
     def __init__(self, path):
         self.path = path
@@ -62,7 +60,7 @@ class Binary:
         self._fp_cache = {}
         self._vt_cache = {}
 
-    # ---- raw reads ----
+    # Raw reads
     def read_va(self, va, n):
         for lo, hi, name, off in self.secs:
             if lo <= va < hi:
@@ -88,7 +86,7 @@ class Binary:
             return t
         return None
 
-    # ---- function entry set (prologue after int3 padding) ----
+    # Function entry set (prologue after int3 padding)
     def entries(self):
         if self._entries is not None:
             return self._entries
@@ -97,7 +95,7 @@ class Binary:
         i = 2
         n = len(data)
         while i < n:
-            # a real function boundary is preceded by >=2 int3 padding bytes;
+            # A real function boundary is preceded by >=2 int3 padding bytes;
             # a lone 0xCC can be an instruction encoding byte (e.g. ModRM of
             # `mov r12, rcx` = 49 89 CC) and must not be treated as padding.
             if (data[i - 1] == 0xCC and data[i - 2] == 0xCC and data[i] != 0xCC
@@ -113,7 +111,7 @@ class Binary:
         i = bisect.bisect_right(e, va) - 1
         return e[i] if i >= 0 else None
 
-    # ---- per-function fingerprint ----
+    # Per-function fingerprint
     def fingerprint(self, entry_va, max_insns=6000, max_bytes=80000):
         key = entry_va
         if key in self._fp_cache:
@@ -193,9 +191,7 @@ def mnem_cos(a, b):
     return dot / (na * nb) if na and nb else 0.0
 
 
-# --------------------------------------------------------------------------- #
-#  signature scanning / parsing / generation
-# --------------------------------------------------------------------------- #
+# Signature scanning, parsing and generation
 def parse_sig(sig):
     pat = bytearray()
     mask = bytearray()
@@ -237,8 +233,8 @@ def scan(binary, sig, limit=None):
 
 
 def _wildcard_positions(ins):
-    """Upstream's convention: keep opcodes, prefixes, ModRM and register
-    encodings literal; wildcard everything that moves between builds -- i.e.
+    """Follows upstream's convention: keep opcodes, prefixes, ModRM and register
+    encodings literal, and wildcard everything that moves between builds, i.e.
     every memory-operand displacement (RIP-relative string loads, vtable-call
     offsets, stack/struct offsets like [rbp-8]) and every immediate (stack-frame
     sizes, constants, and rel8/rel32 branch targets)."""
@@ -252,24 +248,24 @@ def _wildcard_positions(ins):
 
 def gen_sig(binary, entry_va, max_insns=80, min_anchor_insns=6,
             min_anchor_bytes=14, robust_margin=2, extend_pad=True):
-    """Cut a MAXIMALLY ROBUST unique signature at entry_va.
+    """Cut a robust unique signature at entry_va.
 
-    Robustness model: the only bytes that move between builds are operands --
-    displacements, immediates, branch targets (struct offsets shift, frame
-    sizes change, call targets relocate). Those are all wildcarded, so every
-    LITERAL byte in the signature is a stable part of the function: opcode,
-    prefix, ModRM, or register encoding. A signature therefore stays valid as
-    long as the function's own logic is unchanged, and only breaks when the
-    function is genuinely rewritten -- at which point this tool re-derives it.
+    The only bytes that move between builds are operands: displacements,
+    immediates and branch targets (struct offsets shift, frame sizes change,
+    call targets relocate). Those are all wildcarded, so every literal byte in
+    the signature is a stable part of the function: opcode, prefix, ModRM, or
+    register encoding. A signature therefore stays valid as long as the
+    function's own logic is unchanged, and only breaks when the function is
+    rewritten, at which point this tool re-derives it.
 
-    Rather than stop at the first coincidental point of uniqueness (which could
-    be a short, weak prefix), the generator keeps extending until the literal
-    skeleton is a genuine anchor: at least `min_anchor_bytes` stable bytes AND
-    `min_anchor_insns` instructions, plus `robust_margin` instructions beyond
-    the first unique point so uniqueness never rests on a single byte. It stays
-    inside the function body whenever possible; it only reaches into
-    inter-function padding + the neighbour when the body can NEVER be unique (a
-    byte-identical twin), and flags that case as fragile.
+    The first point of uniqueness can be a short, weak prefix, so the generator
+    keeps extending until the literal skeleton is a solid anchor: at least
+    `min_anchor_bytes` stable bytes and `min_anchor_insns` instructions, plus
+    `robust_margin` instructions beyond the first unique point so uniqueness
+    never rests on a single byte. It stays inside the function body whenever
+    possible and only reaches into inter-function padding and the neighbour when
+    the body can never be unique (a byte-identical twin), flagging that case as
+    fragile.
 
     Returns (sig, unique, meta) where meta = {insns, literal_bytes, extended,
     fragile, reason}.
@@ -296,15 +292,14 @@ def gen_sig(binary, entry_va, max_insns=80, min_anchor_insns=6,
 
     while used < max_insns and cur < ntext:
         if data[cur] == 0xCC:
-            # reached the function's end (inter-function padding)
+            # Reached the function's end (inter-function padding).
             if made_unique is not None:
                 break                          # already unique inside the body
             if not extend_pad:
                 break
             # Byte-identical twin: the body alone can never disambiguate. Reach
-            # into the padding + neighbour just far enough to become unique, and
-            # no further -- extra neighbour bytes only add neighbour-dependent
-            # fragility without helping.
+            # into the padding and neighbour just far enough to become unique;
+            # extra neighbour bytes only add fragility without helping.
             while cur < ntext and data[cur] == 0xCC:
                 pat.append(0xCC); mask.append(1); toks.append("CC"); cur += 1
             extended = True
@@ -373,9 +368,7 @@ def scan_pm(binary, pat, mask, limit):
     return hits
 
 
-# --------------------------------------------------------------------------- #
-#  string-anchored relocation
-# --------------------------------------------------------------------------- #
+# String-anchored relocation
 _LEA_FORMS = []
 for _rex in (b"\x48", b"\x4c"):
     for _op in (b"\x8d", b"\x8b"):
@@ -438,9 +431,7 @@ def distinctive(strings):
     return sorted(set(out), key=lambda s: -len(s))[:6]
 
 
-# --------------------------------------------------------------------------- #
-#  RTTI vtable extraction (for offset recovery)
-# --------------------------------------------------------------------------- #
+# RTTI vtable extraction (for offset recovery)
 def mangled_name(class_name):
     # Itanium: bare type name is <len><identifier> for a simple class.
     return ("%d%s" % (len(class_name), class_name)).encode()
@@ -475,7 +466,7 @@ def vtable_functions(binary, class_name):
 
 def _vtable_functions(binary, class_name):
     mn = mangled_name(class_name)
-    # name string must be preceded by \0 (its own start)
+    # The name string must start right after a \0 and end with one (exact match).
     name_candidates = []
     for lo, hi, name, off in binary.secs:
         if not name.startswith(".rodata"):
@@ -488,7 +479,6 @@ def _vtable_functions(binary, class_name):
             if i < 0:
                 break
             if i == 0 or data[i - 1] == 0:
-                # and immediately followed by \0 (exact type name)
                 if data[i + len(mn): i + len(mn) + 1] == b"\x00":
                     name_candidates.append(lo + i)
             i += 1
@@ -522,10 +512,10 @@ def reconcile_offsets(old, new, resolved, report):
     """Vtable indices preserve their relative order across builds (edits are
     insertions/removals that shift a suffix). So within one class the recovered
     new indices must increase with the old indices. A weak CFG match that breaks
-    that ordering is almost certainly a decoy; re-derive it from the consistent
-    delta of its high-confidence siblings and re-score at that slot. This is what
-    rescues e.g. RemoveWeapons: siblings shifted +3 (21->24, 24->27), so old 25
-    must be 28, not a same-looking decoy at 23."""
+    that ordering is almost certainly a decoy, so it is re-derived from the
+    consistent delta of its high-confidence siblings and re-scored at that slot.
+    For example, if the siblings shifted +3 (21->24, 24->27), old index 25 must
+    map to 28, not to a similar-looking decoy at 23."""
     from collections import defaultdict
     groups = defaultdict(list)
     for r in resolved:
@@ -546,7 +536,7 @@ def reconcile_offsets(old, new, resolved, report):
             monotonic = lo < r["new_idx"] < hi
             if monotonic and r["cos"] >= 0.97:
                 continue                      # consistent and confident enough
-            # derive the expected slot from the nearest anchor's delta
+            # Derive the expected slot from the nearest anchor's delta.
             if lower:
                 a = max(lower, key=lambda x: x["old_idx"])
                 expected = a["new_idx"] + (r["old_idx"] - a["old_idx"])
@@ -595,15 +585,13 @@ def recover_vtable_index(old, new, old_funcs, new_funcs, old_idx, band=8):
     return best[0], best[2]
 
 
-# --------------------------------------------------------------------------- #
-#  offset entry -> (class, index) heuristic
-# --------------------------------------------------------------------------- #
+# Offset entry -> (class, index) heuristic
 def split_class_method(entry_name):
     """Return a list of (class, method) candidates to try, longest class first.
     CS gamedata uses Class_Method, but class names themselves contain '_'
     (e.g. CCSPlayer_ItemServices_GiveNamedItem -> class CCSPlayer_ItemServices).
-    We yield every split point so the caller can pick the one whose class has a
-    real vtable."""
+    Every split point is returned so the caller can pick the one whose class has
+    a real vtable."""
     if "::" in entry_name:
         c, m = entry_name.split("::", 1)
         return [(c, m)]
@@ -618,9 +606,7 @@ def split_class_method(entry_name):
     return cands
 
 
-# --------------------------------------------------------------------------- #
-#  main driver
-# --------------------------------------------------------------------------- #
+# Main driver
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--old", required=True)
@@ -642,7 +628,7 @@ def main():
     changed = 0
     needs_review = 0
 
-    # ---------------- signatures ----------------
+    # Signatures
     for name, entry in gd.items():
         if "signatures" not in entry or "linux" not in entry["signatures"]:
             continue
@@ -653,11 +639,11 @@ def main():
             continue
         old_hits = scan(old, sig, limit=8)
         if len(new_hits) > 1 and len(old_hits) > 1:
-            # Byte-identical twins. CSS resolves the sig to the FIRST match, so
+            # Byte-identical twins. CSS resolves the sig to the first match, so
             # target that instance and extend the sig past the function end
-            # (into padding + the next function) until it is unique. This works,
-            # but such a sig depends on the neighbour's layout, so it is
-            # inherently more fragile and always surfaced for review.
+            # (into padding and the next function) until it is unique. Such a
+            # sig depends on the neighbour's layout, so it is more fragile and
+            # always flagged for review.
             target = new_hits[0]
             xsig, uniq, xmeta = gen_sig(new, target)
             xhits = scan(new, xsig, limit=3)
@@ -681,10 +667,10 @@ def main():
             entry["signatures"]["linux"] = rec["new_sig"]
             changed += 1
         else:
-            # BROKEN or LOW_CONFIDENCE: leave the old sig untouched (fail-safe)
+            # BROKEN or LOW_CONFIDENCE: leave the old sig untouched (fail-safe).
             needs_review += 1
 
-    # ---------------- offsets ----------------
+    # Offsets
     resolved_off = []
     for name, entry in gd.items():
         if "offsets" not in entry or "linux" not in entry["offsets"]:
@@ -694,7 +680,7 @@ def main():
         if not cands:
             report["offsets"][name] = {"status": "SKIP_NOT_VTABLE"}
             continue
-        # pick the longest class prefix that actually has a vtable in both builds
+        # Pick the longest class prefix that has a vtable in both builds.
         cls = None
         old_funcs = new_funcs = None
         for c, method in cands:
@@ -718,7 +704,7 @@ def main():
                                        "old_index": old_idx,
                                        "candidate_index": new_idx,
                                        "cosine": round(cos, 4)}
-            # still record it so reconciliation can try to place it by siblings
+            # Still record it so reconciliation can try to place it by siblings.
             if new_idx is not None:
                 resolved_off.append({"name": name, "entry": entry, "cls": cls,
                                      "old_idx": old_idx, "new_idx": new_idx,
@@ -729,7 +715,7 @@ def main():
         status = "OK" if new_idx == old_idx else "REPAIRED"
         rec = {"status": status, "class": cls, "old_index": old_idx,
                "new_index": new_idx, "cosine": round(cos, 4)}
-        # borderline confidence: apply but ask for eyes
+        # Borderline confidence: apply it, but flag for manual review.
         if cos < 0.97 and new_idx != old_idx:
             rec["review"] = "borderline cosine; verify on server"
             needs_review += 1
@@ -741,12 +727,13 @@ def main():
             entry["offsets"]["linux"] = new_idx
             changed += 1
 
-    # cross-check each class for vtable-order consistency and fix decoys
+    # Cross-check each class for vtable-order consistency and fix decoys.
     reconcile_offsets(old, new, resolved_off, report)
-    # recompute after reconciliation (some 'review' flags may have cleared, some
-    # entries may have flipped OK<->REPAIRED). A signature needs review if it is
-    # unresolved (BROKEN/AMBIGUOUS) or could not be corroborated (LOW_CONFIDENCE
-    # / confidence 'low'); the latter are NOT written to gamedata.
+    # Recompute the totals after reconciliation, since some 'review' flags may
+    # have cleared and some entries may have flipped between OK and REPAIRED. A
+    # signature needs review if it is unresolved (BROKEN/AMBIGUOUS) or could not
+    # be corroborated (LOW_CONFIDENCE / confidence 'low'); the latter are not
+    # written to gamedata.
     def _sig_needs_review(v):
         return (v.get("status") in ("BROKEN", "AMBIGUOUS", "LOW_CONFIDENCE")
                 or v.get("confidence") == "low")
@@ -784,8 +771,8 @@ def main():
 
 
 def estimate_size(binary, addr):
-    """Cheap size estimate = distance to the next function entry. Avoids full
-    disassembly for prescreening fallback candidates."""
+    """Cheap size estimate: the distance to the next function entry. Avoids a
+    full disassembly when prescreening fallback candidates."""
     import bisect
     e = binary.entries()
     i = bisect.bisect_right(e, addr)
@@ -850,7 +837,7 @@ def recover_via_callees(old, new, old_addr, min_cos):
     callees = call_targets(old, old_addr)
     if not callees:
         return None, 0.0
-    # rank callees by how distinctive they are (bigger = more unique)
+    # Rank callees by how distinctive they are (bigger = more unique).
     ranked = sorted(set(callees),
                     key=lambda a: old.fingerprint(a)["size"], reverse=True)
     for callee in ranked[:2]:
@@ -860,7 +847,7 @@ def recover_via_callees(old, new, old_addr, min_cos):
         new_callee, cc = match_by_cfg(old, new, cof)
         if new_callee is None or cc < 0.99:
             continue
-        # find NEW callers of new_callee; pick the best CFG match to our target
+        # Of the NEW callers of new_callee, pick the best CFG match to the target.
         best = (None, -1.0)
         for site in call_sites_to(new, new_callee):
             e = new.containing_entry(site)
@@ -878,10 +865,10 @@ def recover_via_callees(old, new, old_addr, min_cos):
 def relaxed_entry_pattern(binary, entry, max_ins=10, min_literal=12):
     """Build a byte pattern from a function's leading instructions with all
     displacement and immediate bytes wildcarded, keeping opcode/prefix/ModRM.
-    This survives the two things that change most across a recompile -- moved
-    string/branch targets and a single altered tail instruction -- so it still
-    matches a function that barely changed. Deliberately NOT required to be
-    unique: it produces a small candidate pool that CFG then ranks."""
+    This survives the two things that change most across a recompile (moved
+    string/branch targets and a single altered tail instruction), so it still
+    matches a function that barely changed. It is not required to be unique:
+    it produces a small candidate pool that CFG matching then ranks."""
     off = entry - binary.tva
     code = binary.text[off:off + 96]
     toks = []
@@ -937,9 +924,9 @@ def corroborate(old, new, old_addr, cand, cosine, margin, of=None):
     """Independently confirm that NEW `cand` really is the OLD function at
     old_addr, using signals that did NOT drive the original selection: retained
     size, referenced strings, called functions, block count, and how clearly
-    the candidate beat the runner-up. Returns a confidence tier + notes. This is
-    what turns a lucky-looking cosine into a trustworthy match: a decoy rarely
-    keeps the same size AND strings AND callees AND block count as the original."""
+    the candidate beat the runner-up. Returns a confidence tier and notes. A
+    decoy can have a high cosine by chance, but it rarely also keeps the same
+    size, strings, callees and block count as the original."""
     of = of or old.fingerprint(old_addr)
     nf = new.fingerprint(cand)
     notes = []
@@ -992,8 +979,8 @@ def corroborate(old, new, old_addr, cand, cosine, margin, of=None):
     frac = passed / total if total else 0.0
     full = (passed == total and total >= 3)
     if full and cosine >= 0.95:
-        # every independent axis agrees -- size, blocks, strings, callees.
-        # That disambiguates even a cosine near-tie, so it's trustworthy.
+        # Every independent axis agrees (size, blocks, strings, callees),
+        # which disambiguates even a cosine near-tie.
         conf = "high"
     elif cosine >= 0.995 and 0.9 <= sr <= 1.12 and not tie:
         conf = "high"
@@ -1010,17 +997,17 @@ def corroborate(old, new, old_addr, cand, cosine, margin, of=None):
 def recover_signature(old, new, name, old_hits, old_sig, min_cos):
     """Locate the function in NEW and regenerate a unique sig.
 
-    Rock-solid selection: rather than accept the first method that clears a
-    cosine threshold (which lets a high-cosine decoy from an early method
-    shadow the real match), gather a candidate from EVERY cheap method, then
-    corroborate each against the old function on independent axes (size,
-    blocks, strings, callees) and keep the best-supported one. The expensive
-    global CFG sweep only runs if nothing else reaches at least 'medium'.
+    Accepting the first method that clears a cosine threshold would let a
+    high-cosine decoy from an early method shadow the real match. Instead, a
+    candidate is gathered from every cheap method, each is corroborated against
+    the old function on independent axes (size, blocks, strings, callees), and
+    the best-supported one is kept. The expensive global CFG sweep only runs if
+    nothing else reaches at least 'medium'.
 
-    Fail-safe: a candidate that can't be corroborated (confidence 'low') is
-    reported with its best guess but its status is LOW_CONFIDENCE and it is NOT
-    written into gamedata -- a hook with a missing sig fails cleanly (disabled),
-    whereas a hook pointed at the wrong function corrupts state."""
+    A candidate that can't be corroborated (confidence 'low') is reported with
+    its best guess, but its status is LOW_CONFIDENCE and it is not written into
+    gamedata: a hook with a missing sig fails cleanly (disabled), whereas a hook
+    pointed at the wrong function corrupts state."""
     if not old_hits:
         return {"status": "BROKEN", "reason": "old sig no longer resolves"}
     old_addr = old_hits[0]
@@ -1036,7 +1023,7 @@ def recover_signature(old, new, name, old_hits, old_sig, min_cos):
         if prev is None or cos > prev[1]:
             cands[addr] = [method, cos, margin]
 
-    # --- cheap methods: all of them contribute a candidate ---
+    # Each cheap method contributes a candidate.
     e, c, m = recover_via_old_anchor(old, new, old_addr, old_sig, min_cos)
     offer(e, "old-anchor", c, m)
 
@@ -1065,7 +1052,7 @@ def recover_signature(old, new, name, old_hits, old_sig, min_cos):
 
     ranked = evaluate()
 
-    # --- escalate to the global CFG sweep only if nothing reached 'medium' ---
+    # Fall back to the global CFG sweep only if nothing reached 'medium'.
     if not ranked or ranked[0][0] < 2:
         target_size = of["size"]
         best = (None, -1.0)

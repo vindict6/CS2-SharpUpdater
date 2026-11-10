@@ -5,11 +5,11 @@ name: update
 # gamedata via reverse engineering, bump the native SDK + Metamod:Source
 # submodules, build CounterStrikeSharp, and publish a ready-to-deploy release.
 #
-# TWO WAYS TO RUN:
+# Run modes:
 #   * scheduled / automatic  - baseline mode: diffs the current build against the
 #     previous run's binary; only proceeds when the BuildID changed.
-#   * manual TEST            - manifest mode: you supply two depot manifest IDs
-#     (from https://steamdb.info/depot/2347773/manifests/) and a CSS ref. Proves
+#   * manual test            - manifest mode: takes two depot manifest IDs
+#     (from https://steamdb.info/depot/2347773/manifests/) and a CSS ref, and runs
 #     the whole pipeline end-to-end without waiting for a real update.
 
 on:
@@ -67,7 +67,7 @@ jobs:
       STATE: ${{ github.workspace }}/../csu-state    # persists across runs on the box
       MODE: ${{ inputs.mode || 'baseline' }}
       CSS_REF: ${{ inputs.css_ref || 'main' }}
-      # scheduled runs have no inputs, so they take the fork too
+      # Scheduled runs have no inputs, so they also default to the vindict6 fork.
       SDK_REPO: ${{ inputs.sdk_repo == 'official' && 'https://github.com/alliedmodders/hl2sdk.git' || 'https://github.com/vindict6/hl2sdk-cs2.git' }}
       SDK_REF: ${{ inputs.sdk_ref || 'cs2' }}
       MMS_REF: ${{ inputs.mms_ref || 'master' }}
@@ -76,10 +76,10 @@ jobs:
         run: |
           # The native/managed builds run in Docker as root and leave root-owned
           # files under $WORK. The runner user often can't delete those and may not
-          # have passwordless sudo -- but it CAN run Docker, and Docker runs as
-          # root, so use a throwaway container to remove them. Falls back to sudo,
-          # then a plain rm. $STATE is never touched (it holds the baseline binary
-          # that must persist across runs).
+          # have passwordless sudo, but it can run Docker as root, so a throwaway
+          # container removes them. Falls back to sudo, then a plain rm. $STATE is
+          # never touched (it holds the baseline binary that must persist across
+          # runs).
           WORK_PARENT="$(cd "$(dirname "$WORK")" && pwd)"
           WORK_NAME="$(basename "$WORK")"
           TARGET="$WORK_PARENT/$WORK_NAME"
@@ -103,7 +103,7 @@ jobs:
           if [ "$(id -u)" = 0 ]; then SUDO="env"; elif sudo -n true 2>/dev/null; then SUDO="sudo -n"; fi
           [ -n "$SUDO" ] && echo "root/sudo available" || echo "::warning::no passwordless sudo; will only do non-root installs"
 
-          # --- apt packages ---
+          # apt packages
           need=()
           for pair in git:git readelf:binutils zip:zip unzip:unzip curl:curl python3:python3; do
             command -v "${pair%%:*}" >/dev/null || need+=("${pair##*:}")
@@ -118,7 +118,7 @@ jobs:
             fi
           fi
 
-          # --- pip (non-root bootstrap if apt could not provide it) ---
+          # pip (non-root bootstrap if apt could not provide it)
           if ! python3 -m pip --version >/dev/null 2>&1; then
             python3 -m ensurepip --user >/dev/null 2>&1 \
               || curl -fsSL https://bootstrap.pypa.io/get-pip.py | python3 - --user --break-system-packages \
@@ -126,12 +126,12 @@ jobs:
           fi
           python3 -m pip --version
 
-          # --- python deps (pyelftools + capstone for the RE engine) ---
+          # Python deps (pyelftools + capstone for the RE engine)
           python3 -m pip install --user --upgrade --break-system-packages pyelftools capstone 2>/dev/null \
             || python3 -m pip install --user --upgrade pyelftools capstone
           python3 -c "import elftools, capstone; print('pyelftools', elftools.__version__, 'capstone', capstone.__version__)"
 
-          # --- required CLI tools (readelf/zip/unzip have python fallbacks) ---
+          # Required CLI tools (readelf/zip/unzip have python fallbacks)
           for t in git curl docker; do
             command -v "$t" >/dev/null || { echo "::error::'$t' is missing and could not be installed (no passwordless sudo). Install it on the runner: sudo apt-get install -y git curl docker.io"; exit 1; }
           done
@@ -140,7 +140,7 @@ jobs:
           done
           docker --version
 
-          # --- docker daemon access for the runner user ---
+          # Docker daemon access for the runner user
           if ! docker info >/dev/null 2>&1; then
             if [ -n "$SUDO" ]; then
               $SUDO systemctl enable --now docker 2>/dev/null || $SUDO service docker start 2>/dev/null || true
@@ -149,7 +149,7 @@ jobs:
             if docker info >/dev/null 2>&1; then
               echo "docker daemon: OK"
             elif sg docker -c 'docker info' >/dev/null 2>&1; then
-              # membership added just now; this shell predates it, so run docker via sg
+              # The group membership is newer than this shell, so run docker via sg.
               echo "docker daemon: OK via 'sg docker' (restart the runner service to make it permanent)"
               echo "DOCKER_SG=1" >> "$GITHUB_ENV"
             else
@@ -175,7 +175,7 @@ jobs:
         id: build
         if: steps.fetch.outputs.UPDATE == 'true'
         env:
-          # default true on scheduled runs (inputs.with_runtime is empty then)
+          # Defaults to 1 on scheduled runs, where inputs.with_runtime is empty.
           BUNDLE_RUNTIME: ${{ (inputs.with_runtime == false) && '0' || '1' }}
         run: |
           chmod +x tools/run_pipeline.sh
@@ -190,7 +190,7 @@ jobs:
           { echo "SUBMODULES<<EOF"; cat "$OUT/SUBMODULES"; echo "EOF"; } >> "$GITHUB_OUTPUT"
 
       - name: Upload build artifact
-        # also on build failure: the recovered gamedata + report are still useful
+        # Runs even if the build failed, since the recovered gamedata and report are still useful.
         if: always() && steps.fetch.outputs.UPDATE == 'true'
         uses: actions/upload-artifact@v4
         with:

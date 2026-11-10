@@ -3,16 +3,16 @@
 #
 # CS2 dedicated server = Steam app 730, depot 2347773. That depot needs a real
 # Steam account (anonymous can't access it), hence STEAM_USER / STEAM_PASS.
-# We download only one file: game/csgo/bin/linuxsteamrt64/libserver.so
+# Only one file is downloaded: game/csgo/bin/linuxsteamrt64/libserver.so
 #
 # Two modes:
 #   MODE=manifest  (TESTING)  - download two explicit historical builds by their
 #                               depot manifest IDs. Deterministic, repeatable,
-#                               needs no prior state. Use this to prove the
-#                               pipeline works without waiting for a real update.
+#                               needs no prior state. Useful for testing the
+#                               pipeline without waiting for a real update.
 #       requires: OLD_MANIFEST, NEW_MANIFEST
 #
-#   MODE=baseline  (PRODUCTION) - download the CURRENT build; treat the previous
+#   MODE=baseline  (PRODUCTION) - download the current build; treat the previous
 #                               run's binary (STATE_DIR/libserver.prev.so) as OLD.
 #                               Detects updates by BuildID change.
 #
@@ -34,7 +34,7 @@ FILE="game/csgo/bin/linuxsteamrt64/libserver.so"
 out() { echo "$1" >> "${GITHUB_OUTPUT:-/dev/stdout}"; }
 buildid() { python3 "$(dirname "$0")/buildid.py" "$1"; }
 
-# ---- locate / install DepotDownloader ----
+# Locate DepotDownloader, installing it into $STATE if it isn't available.
 DD="${DEPOTDOWNLOADER:-}"
 if [ -z "$DD" ]; then
   if command -v DepotDownloader >/dev/null 2>&1; then DD="DepotDownloader"
@@ -55,7 +55,7 @@ fi
 echo "[fetch] DepotDownloader: $DD"
 echo "$FILE" > "$WORK/filelist.txt"
 
-# download one specific manifest into $1, copy the .so to $2
+# Download manifest $1 (or reuse the cached copy) and copy the .so to $2.
 dl_manifest() {
   local manifest="$1" dest="$2" dir cached
   cached="$STATE/cache/libserver.${manifest}.so"
@@ -75,7 +75,7 @@ dl_manifest() {
   cp "$dir/$FILE" "$dest"
 }
 
-# download the CURRENT build (latest manifest) into $1
+# Download the current build (latest manifest) and copy the .so to $1.
 dl_current() {
   local dest="$1" dir="$WORK/dl_current"
   rm -rf "$dir"; mkdir -p "$dir"
@@ -99,7 +99,7 @@ if [ "$MODE" = "manifest" ]; then
   exit 0
 fi
 
-# ---- baseline mode ----
+# Baseline mode: compare the current build against the previous run's binary.
 dl_current "$WORK/libserver.new.so"
 NEW_ID=$(buildid "$WORK/libserver.new.so")
 echo "[fetch] current BuildID=$NEW_ID"
