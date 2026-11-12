@@ -62,6 +62,28 @@ git clone --depth 1 --branch "$CSS_REF" "$CSS_REPO" "$CSS" 2>/dev/null \
 ( cd "$CSS" && git checkout -q "$CSS_REF" 2>/dev/null || true
   git submodule update --init --recursive --depth 1 )
 
+# Upstream fixes that aren't released yet: cherry-pick each listed pull request's own
+# commits (the ones not on upstream main) onto CSS_REF. Any failure stops the build, so a
+# release can never quietly ship without a fix it was asked to carry.
+if [ -n "${CSS_PRS:-}" ]; then
+  echo "==> [1b/7] apply upstream pull requests: $CSS_PRS"
+  ( cd "$CSS"
+    git config user.name "CS2-SharpUpdater"
+    git config user.email "cs2-sharpupdater@users.noreply.github.com"
+    git fetch -q --unshallow origin 2>/dev/null || true
+    git fetch -q origin "+refs/heads/main:refs/remotes/origin/main"
+    for pr in ${CSS_PRS//,/ }; do
+      git fetch -q origin "+pull/$pr/head:refs/css-pr/$pr" || { echo "ERROR: could not fetch pull request #$pr"; exit 1; }
+      commits="$(git rev-list --reverse --no-merges "refs/css-pr/$pr" ^origin/main)"
+      [ -n "$commits" ] || { echo "ERROR: pull request #$pr has no commits beyond main"; exit 1; }
+      for c in $commits; do
+        echo "    #$pr: $(git log -1 --format='%h %s' "$c")"
+        git cherry-pick -x "$c" >/dev/null || { echo "ERROR: #$pr commit ${c:0:8} does not apply to $CSS_REF"; exit 1; }
+      done
+    done
+    echo "    CounterStrikeSharp now at $(git rev-parse --short HEAD) ($CSS_REF + #${CSS_PRS//,/, #})" ) || exit 1
+fi
+
 echo "==> [2/7] bump hl2sdk-cs2 -> $SDK_REPO @ $SDK_REF"
 SDK_PIN="$(git -C "$CSS" rev-parse "HEAD:libraries/hl2sdk-cs2")"
 ( cd "$CSS/libraries/hl2sdk-cs2"

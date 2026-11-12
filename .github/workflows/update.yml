@@ -25,6 +25,9 @@ on:
       css_ref:
         description: "CounterStrikeSharp ref/tag to build (e.g. v1.0.305 or main)"
         default: "main"
+      css_prs:
+        description: "upstream CounterStrikeSharp pull requests to apply on top of css_ref, comma-separated (e.g. 1490)"
+        default: ""
       sdk_repo:
         description: "hl2sdk-cs2 source: vindict6 (vindict6/hl2sdk-cs2, ABI fixes ahead of upstream) or official (alliedmodders/hl2sdk)"
         type: choice
@@ -67,6 +70,7 @@ jobs:
       STATE: ${{ github.workspace }}/../csu-state    # persists across runs on the box
       MODE: ${{ inputs.mode || 'baseline' }}
       CSS_REF: ${{ inputs.css_ref || 'main' }}
+      CSS_PRS: ${{ inputs.css_prs || '' }}
       # Scheduled runs have no inputs, so they also default to the vindict6 fork.
       SDK_REPO: ${{ inputs.sdk_repo == 'official' && 'https://github.com/alliedmodders/hl2sdk.git' || 'https://github.com/vindict6/hl2sdk-cs2.git' }}
       SDK_REF: ${{ inputs.sdk_ref || 'cs2' }}
