@@ -94,8 +94,14 @@ def main():
         else:
             numbers = [int(n) for n in which.replace(" ", "").split(",") if n]
         for n in numbers:
-            pr = api(f"pulls/{n}")
-            diff = api(f"pulls/{n}", accept="application/vnd.github.v3.diff")
+            # The diff and the head it came from, read until they agree (a push in between would mislabel the diff)
+            for _ in range(3):
+                pr = api(f"pulls/{n}")
+                diff = api(f"pulls/{n}", accept="application/vnd.github.v3.diff")
+                if api(f"pulls/{n}")["head"]["sha"] == pr["head"]["sha"]:
+                    break
+            else:
+                sys.exit(f"::error::s2sdk #{n} keeps changing while being read; try again in a minute")
             git_apply(sdk, diff, f"s2sdk #{n}")
             print(f"applied s2sdk #{n} ({pr['head']['sha'][:8]}: {pr['title'][:60]})")
             applied.append(str(n))

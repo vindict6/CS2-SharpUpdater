@@ -229,6 +229,8 @@ MMS_USED="$(git -C "$CSS/libraries/metamod-source" rev-parse HEAD)"
 echo "    built against hl2sdk-cs2 ${SDK_FROM%.git}@${SDK_USED:0:8}, metamod-source ${MMS_USED:0:8}"
 printf 'hl2sdk-cs2 %s@%s%s\nmetamod-source %s\n' "${SDK_FROM%.git}" "$SDK_USED" \
   "${SDK_APPLIED:+ (cs2 + s2sdk #${SDK_APPLIED//,/, #})}" "$MMS_USED" > "$OUT/SUBMODULES"
+# The SDK commit this build used, before the s2sdk fixes, so build_metamod.sh builds on the same one
+echo "${SDK_FROM} $(git -C "$CSS/libraries/hl2sdk-cs2" rev-parse "HEAD${SDK_APPLIED:+~1}")" > "$OUT/SDK_BASE"
 # CMake copies configs/ (incl. our recovered gamedata) into build/addons.
 rm -rf "$WORK/dist"; mkdir -p "$WORK/dist"
 cp -r "$CSS/build/addons" "$WORK/dist/addons"

@@ -26,16 +26,23 @@ git clone -q "$MMS_REPO" "$MMS_WORK/metamod-source"
 
 echo "==> [mm 2/3] build (Linux x86_64, $IMAGE)"
 # The exact fixes CounterStrikeSharp was built with, when run_pipeline.sh ran first in this job
+SDK_BASE=""
+[ -f "$OUT/SDK_BASE" ] && SDK_BASE="$(cat "$OUT/SDK_BASE")"
 if [ -f "$OUT/sdk-fixes.patch" ]; then
   cp "$OUT/sdk-fixes.patch" "$OUT/sdk-fixes.patch.prs" "$MMS_WORK/"
   SDK_PRS="patch:/w/sdk-fixes.patch"
 fi
-docker run --rm -v "$MMS_WORK:/w" -v "$HERE:/tools:ro" -e SDK_PRS="$SDK_PRS" -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" "$IMAGE" bash -euc '
+docker run --rm -v "$MMS_WORK:/w" -v "$HERE:/tools:ro" -e SDK_PRS="$SDK_PRS" -e SDK_BASE="$SDK_BASE" -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" "$IMAGE" bash -euc '
   set -o pipefail
   git config --global --add safe.directory "*"
   cd /w/deps
   mkdir -p metamod-source   # checkout-deps.sh wants a sibling folder by that name
   ../metamod-source/support/checkout-deps.sh -s cs2 >/dev/null
+  if [ -n "$SDK_BASE" ]; then   # the commit CounterStrikeSharp was built on
+    git -C hl2sdk-cs2 fetch -q --depth 1 ${SDK_BASE}
+    git -C hl2sdk-cs2 -c advice.detachedHead=false checkout -q FETCH_HEAD
+    echo "hl2sdk-cs2 at $(git -C hl2sdk-cs2 rev-parse --short HEAD), as CounterStrikeSharp"
+  fi
   GITHUB_OUTPUT= python3 /tools/apply_sdk_prs.py /w/deps/hl2sdk-cs2 "$SDK_PRS" | tee /w/sdk_prs.log
   cd /w/metamod-source
   rm -rf build && mkdir build && cd build

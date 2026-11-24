@@ -78,6 +78,8 @@ permissions:
 jobs:
   update:
     runs-on: [self-hosted]        # must have Steam access + Docker
+    # Below GitHub's 6 h limit; deploy_amp.py stops starting new servers after 5 h, so it is never killed mid-swap
+    timeout-minutes: 350
     env:
       WORK: ${{ github.workspace }}/../csu-work
       OUT: ${{ github.workspace }}/out
@@ -262,6 +264,7 @@ jobs:
       # Off until the repo has the AMP_URL/AMP_USER/AMP_PASSWORD(/AMP_TOTP_SECRET) secrets and the AMP_TARGETS and
       # AMP_GAME_HOST variables. One server at a time, first one first: a crash rolls that server back and stops.
       - name: Deploy to AMP servers
+        id: deploy
         if: steps.build.outcome == 'success' && inputs.deploy != false && vars.AMP_TARGETS != ''
         env:
           AMP_URL: ${{ secrets.AMP_URL }}
@@ -276,10 +279,22 @@ jobs:
           [ -n "$AMP_URL" ] && [ -n "$AMP_PASSWORD" ] || { echo "::warning::AMP_TARGETS is set but the AMP secrets aren't; not deploying"; exit 0; }
           css_zip=$(ls out/counterstrikesharp-*linux*.zip | head -1)
           mm_tar=$(ls out/mmsource-*-cs2-linux.tar.gz 2>/dev/null | head -1 || true)
+          set +e
           python3 tools/deploy_amp.py "$css_zip" "$mm_tar"
+          code=$?
+          set -e
+          # 0 deployed, 2 crashed and rolled back, 3 skipped or stopped on an error (try again later), 4 rollback incomplete
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          [ "$code" = 0 ] || echo "::error::AMP deploy finished with code $code; see the log above"
+          exit $code
 
+      # Promote when the deploy is settled: done, not configured, or the build crashed a server and was rolled back
+      # (retrying it every 15 minutes would crash it again). A skipped or interrupted deploy keeps the old baseline,
+      # so the next scheduled run builds and tries again.
       - name: Promote baseline (baseline mode, successful build only)
-        if: always() && steps.build.outcome == 'success' && (github.event_name == 'schedule' || inputs.mode == 'baseline')
+        if: >-
+          always() && steps.build.outcome == 'success' && (github.event_name == 'schedule' || inputs.mode == 'baseline')
+          && (steps.deploy.outcome == 'skipped' || steps.deploy.outputs.code == '0' || steps.deploy.outputs.code == '2')
         run: |
           mkdir -p "$STATE"
           cp "$WORK/libserver.new.so" "$STATE/libserver.prev.so"
