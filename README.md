@@ -213,8 +213,11 @@ Set these as workflow inputs (manual runs) or edit `update.yml`:
 |---|---|---|
 | `mode` | `baseline` (auto-diff) or `manifest` (pinned test) | `baseline` |
 | `css_ref` | CounterStrikeSharp tag/branch to build | `main` |
-| `sdk_repo` | where `sdk_ref` comes from: `vindict6` ([vindict6/hl2sdk-cs2](https://github.com/vindict6/hl2sdk-cs2)) or `official` (`alliedmodders/hl2sdk`). With `vindict6` the build fails instead of falling back to the CSS-pinned SDK, since that fallback would drop the ABI fix | `vindict6` |
+| `sdk_repo` | where `sdk_ref` comes from: `official` (`alliedmodders/s2sdk`) or `vindict6` ([vindict6/hl2sdk-cs2](https://github.com/vindict6/hl2sdk-cs2)). With `vindict6`, or once an s2sdk fix is applied, the build fails instead of falling back to the CSS-pinned SDK, since that fallback would drop the ABI fix | `official` |
 | `sdk_ref` | `hl2sdk-cs2` commit/branch to pin (native engine ABI) | `cs2` |
+| `sdk_prs` | s2sdk pull requests applied on top: `auto` = open ones into `cs2` from its members and past contributors, opened in the last 30 days, touching only headers under `public/` (one that no longer applies is skipped); `none`; or numbers like `128` (must apply) | `auto` |
+| `build_metamod` | also build a Linux Metamod:Source from `mms_ref` with the same s2sdk fixes (`mmsource-*-cs2-linux.tar.gz` in the release) | `true` |
+| `deploy` | roll the build out to AMP servers (see below) | `true` |
 | `mms_ref` | `metamod-source` commit/branch to pin (plugin API) | `master` |
 | `old_manifest` / `new_manifest` | depot manifest IDs (manifest mode) | — |
 | `publish_release` | create a GitHub Release | `true` |
@@ -226,6 +229,30 @@ the CSS version you build (upstream `main` currently uses .NET 10; older tags us
 .NET 8). `SKIP_BUILD=1` stops after the RE recovery, so you can run the fetch +
 recovery by hand on a machine without Docker and still get `gamedata.json` and
 `recovery-report.json`.
+
+### Automatic rollout to AMP servers (optional)
+
+After a successful build the workflow can install it on CS2 servers run by CubeCoders AMP, one server at a time.
+It stays off until you add these to the repo (Settings > Secrets and variables > Actions):
+
+- secrets `AMP_URL` (the panel, e.g. `https://panel.example.com`), `AMP_USER`, `AMP_PASSWORD`, and `AMP_TOTP_SECRET`
+  if that user has 2FA. The user needs File Manager and Start/Stop on each instance.
+- variable `AMP_TARGETS`: `instance-id:game-port:name`, comma separated, in rollout order. Put a test or quiet server
+  first.
+- variable `AMP_GAME_HOST`: the servers' public IP (used to see whether anyone is playing).
+- optional variable `AMP_WAIT_EMPTY_MINUTES` (default 120).
+
+For each server, `tools/deploy_amp.py`:
+1. Waits until nobody is playing. If someone still is after the wait, it skips that server.
+2. Stops the server.
+3. Moves CounterStrikeSharp's `api`, `bin` and `gamedata` and Metamod's `bin` aside as `<name>.<version>bak`, and
+   extracts the new ones. Configs, plugins and Metamod's `.vdf` files are never touched.
+4. Checks the new binaries' MD5s, then starts the server.
+5. Watches it for 4 minutes after AMP reports it running.
+
+If the server crashes (a segfault, AMP's Failed state, a restart) or CounterStrikeSharp doesn't start, it puts the
+old files back, starts the server again, and stops the rollout. The baseline is promoted either way, so a build that
+crashed isn't retried every 15 minutes; rerun the workflow by hand once it's fixed.
 
 ---
 
@@ -319,6 +346,9 @@ tools/
   cs2_update_gamedata.py   # the RE engine (signatures + vtable offsets + report)
   fetch_libserver.sh       # depot fetch: manifest (test) or baseline (auto) mode
   run_pipeline.sh          # clone CSS, bump SDK, RE, build native+managed, bundle
+  apply_sdk_prs.py         # apply open s2sdk fix pull requests on top of the SDK
+  build_metamod.sh         # Linux Metamod:Source with the same SDK fixes
+  deploy_amp.py            # optional rollout to AMP servers with rollback
   GamedataSmokeTest.cs/.csproj   # optional in-game validation plugin
 .github/workflows/
   update.yml               # the pipeline (schedule + manual/test)

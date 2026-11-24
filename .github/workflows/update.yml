@@ -1,9 +1,11 @@
 name: update
 
 # CS2-SharpUpdater main pipeline.
-# On a CS2 update (or on demand), fetch old+new libserver.so, recover the CSS
-# gamedata via reverse engineering, bump the native SDK + Metamod:Source
-# submodules, build CounterStrikeSharp, and publish a ready-to-deploy release.
+# On a CS2 update (checked every 15 minutes, or on demand), fetch old+new libserver.so,
+# recover the CSS gamedata via reverse engineering, bump the native SDK + Metamod:Source
+# submodules with any open s2sdk fixes applied, build CounterStrikeSharp and a Linux
+# Metamod:Source, publish a ready-to-deploy release, and (when configured) roll it out
+# to AMP-managed servers one at a time with an automatic rollback on a crash.
 #
 # Run modes:
 #   * scheduled / automatic  - baseline mode: diffs the current build against the
@@ -13,8 +15,9 @@ name: update
 #     the whole pipeline end-to-end without waiting for a real update.
 
 on:
-  #schedule:
-  #  - cron: "*/30 * * * *"
+  # Only does real work when the CS2 build changed (baseline mode)
+  schedule:
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -29,10 +32,13 @@ on:
         description: "upstream CounterStrikeSharp pull requests to apply on top of css_ref, comma-separated (e.g. 1490)"
         default: ""
       sdk_repo:
-        description: "hl2sdk-cs2 source: vindict6 (vindict6/hl2sdk-cs2, ABI fixes ahead of upstream) or official (alliedmodders/hl2sdk)"
+        description: "hl2sdk-cs2 source: official (alliedmodders/s2sdk) or vindict6 (vindict6/hl2sdk-cs2)"
         type: choice
-        options: [vindict6, official]
-        default: vindict6
+        options: [official, vindict6]
+        default: official
+      sdk_prs:
+        description: "s2sdk pull requests to build with: auto (open header fixes from its contributors), none, or numbers like 128"
+        default: "auto"
       sdk_ref:
         description: "hl2sdk-cs2 commit/branch to pin (native engine ABI)"
         default: "cs2"
@@ -53,6 +59,14 @@ on:
         description: "bundle the .NET runtime into the zip (off = server must have the runtime)"
         type: boolean
         default: true
+      build_metamod:
+        description: "also build a Linux Metamod:Source (mms_ref + the same s2sdk fixes) into the release"
+        type: boolean
+        default: true
+      deploy:
+        description: "roll the build out to the AMP servers in the AMP_TARGETS variable (needs the AMP_* secrets)"
+        type: boolean
+        default: true
 
 concurrency:
   group: cs2-sharpupdater
@@ -71,9 +85,11 @@ jobs:
       MODE: ${{ inputs.mode || 'baseline' }}
       CSS_REF: ${{ inputs.css_ref || 'main' }}
       CSS_PRS: ${{ inputs.css_prs || '' }}
-      # Scheduled runs have no inputs, so they also default to the vindict6 fork.
-      SDK_REPO: ${{ inputs.sdk_repo == 'official' && 'https://github.com/alliedmodders/hl2sdk.git' || 'https://github.com/vindict6/hl2sdk-cs2.git' }}
+      # Scheduled runs have no inputs: official s2sdk cs2 plus its open fixes (auto)
+      SDK_REPO: ${{ inputs.sdk_repo == 'vindict6' && 'https://github.com/vindict6/hl2sdk-cs2.git' || 'https://github.com/alliedmodders/hl2sdk.git' }}
       SDK_REF: ${{ inputs.sdk_ref || 'cs2' }}
+      SDK_PRS: ${{ inputs.sdk_prs || 'auto' }}
+      GITHUB_TOKEN: ${{ github.token }}
       MMS_REF: ${{ inputs.mms_ref || 'master' }}
     steps:
       - name: Wipe scratch work dir (clears root-owned Docker leftovers)
@@ -193,6 +209,14 @@ jobs:
           echo "VERSION=$(cat "$OUT/VERSION")" >> "$GITHUB_OUTPUT"
           { echo "SUBMODULES<<EOF"; cat "$OUT/SUBMODULES"; echo "EOF"; } >> "$GITHUB_OUTPUT"
 
+      - name: Build Linux Metamod:Source
+        id: metamod
+        if: steps.build.outcome == 'success' && inputs.build_metamod != false
+        run: |
+          chmod +x tools/build_metamod.sh
+          if [ "${DOCKER_SG:-0}" = "1" ]; then sg docker -c tools/build_metamod.sh; else tools/build_metamod.sh; fi
+          { echo "METAMOD<<EOF"; cat "$OUT/METAMOD"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+
       - name: Upload build artifact
         # Runs even if the build failed, since the recovered gamedata and report are still useful.
         if: always() && steps.fetch.outputs.UPDATE == 'true'
@@ -202,6 +226,7 @@ jobs:
           if-no-files-found: ignore
           path: |
             out/*.zip
+            out/*.tar.gz
             out/gamedata.json
             out/recovery-report.json
 
@@ -220,16 +245,41 @@ jobs:
             ${{ steps.build.outputs.SUBMODULES }}
             ```
 
+            Linux Metamod:Source (`mmsource-*-cs2-linux.tar.gz`, extract into `game/csgo/`):
+            ```
+            ${{ steps.metamod.outputs.METAMOD || 'not built' }}
+            ```
+
             The `with-runtime` zip drops into `<server>/game/csgo/`. See the attached
             `recovery-report.json` for which signatures/offsets were repaired and
             anything flagged for review.
           files: |
             out/*.zip
+            out/*.tar.gz
             out/gamedata.json
             out/recovery-report.json
 
+      # Off until the repo has the AMP_URL/AMP_USER/AMP_PASSWORD(/AMP_TOTP_SECRET) secrets and the AMP_TARGETS and
+      # AMP_GAME_HOST variables. One server at a time, first one first: a crash rolls that server back and stops.
+      - name: Deploy to AMP servers
+        if: steps.build.outcome == 'success' && inputs.deploy != false && vars.AMP_TARGETS != ''
+        env:
+          AMP_URL: ${{ secrets.AMP_URL }}
+          AMP_USER: ${{ secrets.AMP_USER }}
+          AMP_PASSWORD: ${{ secrets.AMP_PASSWORD }}
+          AMP_TOTP_SECRET: ${{ secrets.AMP_TOTP_SECRET }}
+          AMP_TARGETS: ${{ vars.AMP_TARGETS }}
+          AMP_GAME_HOST: ${{ vars.AMP_GAME_HOST }}
+          AMP_WAIT_EMPTY_MINUTES: ${{ vars.AMP_WAIT_EMPTY_MINUTES || '120' }}
+          DEPLOY_TAG: ${{ steps.build.outputs.VERSION }}
+        run: |
+          [ -n "$AMP_URL" ] && [ -n "$AMP_PASSWORD" ] || { echo "::warning::AMP_TARGETS is set but the AMP secrets aren't; not deploying"; exit 0; }
+          css_zip=$(ls out/counterstrikesharp-*linux*.zip | head -1)
+          mm_tar=$(ls out/mmsource-*-cs2-linux.tar.gz 2>/dev/null | head -1 || true)
+          python3 tools/deploy_amp.py "$css_zip" "$mm_tar"
+
       - name: Promote baseline (baseline mode, successful build only)
-        if: steps.build.outcome == 'success' && (github.event_name == 'schedule' || inputs.mode == 'baseline')
+        if: always() && steps.build.outcome == 'success' && (github.event_name == 'schedule' || inputs.mode == 'baseline')
         run: |
           mkdir -p "$STATE"
           cp "$WORK/libserver.new.so" "$STATE/libserver.prev.so"

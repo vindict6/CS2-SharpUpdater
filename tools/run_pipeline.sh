@@ -23,6 +23,8 @@
 #                        ahead of upstream)
 #   SDK_REF              hl2sdk-cs2 commit/branch to pin (default: cs2 head)
 #   MMS_REF              metamod-source commit/branch to pin (default: master head)
+#   SDK_PRS              s2sdk pull requests to apply on top of the SDK: auto (default: open
+#                        header-only fixes from s2sdk's contributors), none, or "128,130"
 #   SKIP_BUILD           1 = stop after the RE recovery (no Docker needed); the
 #                        recovered gamedata.json + report still land in $OUT
 #   DOTNET_TAG           dotnet SDK image tag (default: 10.0)
@@ -109,6 +111,21 @@ if [ -n "$SDK_MISSING" ]; then
     git checkout -q "$SDK_PIN"
     git submodule update --init --recursive --depth 1 )
 fi
+
+# After a CS2 update the SDK fix (a new or moved virtual) usually waits in an open s2sdk
+# pull request for a while; without it the build compiles fine and crashes the server.
+SDK_PRS="${SDK_PRS:-auto}"
+echo "==> [2b/7] s2sdk fixes not merged upstream: $SDK_PRS"
+SDK_LOG="$(GITHUB_OUTPUT= python3 "$HERE/apply_sdk_prs.py" "$CSS/libraries/hl2sdk-cs2" "$SDK_PRS")" \
+  || { echo "$SDK_LOG"; exit 1; }
+echo "$SDK_LOG" | sed 's/^/    /'
+SDK_APPLIED="$(echo "$SDK_LOG" | sed -n 's/^applied s2sdk #//p' | paste -sd, -)"
+if [ -n "$SDK_APPLIED" ]; then
+  SDK_CUSTOM=1   # never fall back to the CSS-pinned SDK: that would drop the fix
+  git -C "$CSS/libraries/hl2sdk-cs2" -c user.name=CS2-SharpUpdater \
+    -c user.email=cs2-sharpupdater@users.noreply.github.com commit -qam "s2sdk #${SDK_APPLIED//,/, #}"
+fi
+echo "$SDK_APPLIED" > "$OUT/SDK_PRS"
 
 echo "==> [3/7] bump metamod-source -> $MMS_REF"
 MMS_PIN="$(git -C "$CSS" rev-parse "HEAD:libraries/metamod-source")"
@@ -210,7 +227,8 @@ SDK_USED="$(git -C "$CSS/libraries/hl2sdk-cs2" rev-parse HEAD)"
 MMS_USED="$(git -C "$CSS/libraries/metamod-source" rev-parse HEAD)"
 [ "$SDK_USED" = "$SDK_PIN" ] && SDK_FROM="$SDK_OFFICIAL" || SDK_FROM="$SDK_REPO"
 echo "    built against hl2sdk-cs2 ${SDK_FROM%.git}@${SDK_USED:0:8}, metamod-source ${MMS_USED:0:8}"
-printf 'hl2sdk-cs2 %s@%s\nmetamod-source %s\n' "${SDK_FROM%.git}" "$SDK_USED" "$MMS_USED" > "$OUT/SUBMODULES"
+printf 'hl2sdk-cs2 %s@%s%s\nmetamod-source %s\n' "${SDK_FROM%.git}" "$SDK_USED" \
+  "${SDK_APPLIED:+ (cs2 + s2sdk #${SDK_APPLIED//,/, #})}" "$MMS_USED" > "$OUT/SUBMODULES"
 # CMake copies configs/ (incl. our recovered gamedata) into build/addons.
 rm -rf "$WORK/dist"; mkdir -p "$WORK/dist"
 cp -r "$CSS/build/addons" "$WORK/dist/addons"
