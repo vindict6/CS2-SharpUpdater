@@ -116,10 +116,10 @@ fi
 # pull request for a while; without it the build compiles fine and crashes the server.
 SDK_PRS="${SDK_PRS:-auto}"
 echo "==> [2b/7] s2sdk fixes not merged upstream: $SDK_PRS"
-SDK_LOG="$(GITHUB_OUTPUT= python3 "$HERE/apply_sdk_prs.py" "$CSS/libraries/hl2sdk-cs2" "$SDK_PRS")" \
+SDK_LOG="$(GITHUB_OUTPUT= python3 "$HERE/apply_sdk_prs.py" "$CSS/libraries/hl2sdk-cs2" "$SDK_PRS" --save "$OUT/sdk-fixes.patch")" \
   || { echo "$SDK_LOG"; exit 1; }
 echo "$SDK_LOG" | sed 's/^/    /'
-SDK_APPLIED="$(echo "$SDK_LOG" | sed -n 's/^applied s2sdk #//p' | paste -sd, -)"
+SDK_APPLIED="$(echo "$SDK_LOG" | sed -n 's/^applied s2sdk #\([0-9]*\).*/\1/p' | paste -sd, -)"
 if [ -n "$SDK_APPLIED" ]; then
   SDK_CUSTOM=1   # never fall back to the CSS-pinned SDK: that would drop the fix
   git -C "$CSS/libraries/hl2sdk-cs2" -c user.name=CS2-SharpUpdater \

@@ -25,7 +25,13 @@ git clone -q "$MMS_REPO" "$MMS_WORK/metamod-source"
   echo "    metamod-source at $(git rev-parse --short HEAD) ($(git log -1 --format=%s | cut -c1-70))" )
 
 echo "==> [mm 2/3] build (Linux x86_64, $IMAGE)"
+# The exact fixes CounterStrikeSharp was built with, when run_pipeline.sh ran first in this job
+if [ -f "$OUT/sdk-fixes.patch" ]; then
+  cp "$OUT/sdk-fixes.patch" "$OUT/sdk-fixes.patch.prs" "$MMS_WORK/"
+  SDK_PRS="patch:/w/sdk-fixes.patch"
+fi
 docker run --rm -v "$MMS_WORK:/w" -v "$HERE:/tools:ro" -e SDK_PRS="$SDK_PRS" -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" "$IMAGE" bash -euc '
+  set -o pipefail
   git config --global --add safe.directory "*"
   cd /w/deps
   mkdir -p metamod-source   # checkout-deps.sh wants a sibling folder by that name
@@ -42,7 +48,7 @@ PKG="$MMS_WORK/metamod-source/build/package"
 [ -f "$PKG/addons/metamod/bin/linuxsteamrt64/metamod.2.cs2.so" ] || { echo "ERROR: metamod.2.cs2.so was not built"; exit 1; }
 BASE="$(cat "$MMS_WORK/metamod-source/product.version")"; BASE="${BASE%-dev}"
 REV="$(git -C "$MMS_WORK/metamod-source" rev-list --count HEAD)"
-APPLIED="$(sed -n 's/^applied s2sdk #//p' "$MMS_WORK/sdk_prs.log" | paste -sd, -)"
+APPLIED="$(sed -n 's/^applied s2sdk #\([0-9]*\).*/\1/p' "$MMS_WORK/sdk_prs.log" | paste -sd, -)"
 NAME="mmsource-${BASE}-git${REV}-cs2-linux.tar.gz"
 tar -C "$PKG" -czf "$OUT/$NAME" addons
 echo "metamod-source $(git -C "$MMS_WORK/metamod-source" rev-parse HEAD) ${BASE}-git${REV}${APPLIED:+ (s2sdk cs2 + #${APPLIED//,/, #})}" > "$OUT/METAMOD"
